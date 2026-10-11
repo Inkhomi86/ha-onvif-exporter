@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 from pathlib import Path
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
@@ -20,8 +21,17 @@ def load(name):
     spec.loader.exec_module(module)
     return module
 
+def ha_callback(target):
+    """HA 2026.8.1 core.callback's job-classification marker."""
+    target._hass_callback = True
+    return target
+
+
+ha_core = ModuleType("homeassistant.core")
+ha_core.callback = ha_callback
 policy = load("policy")
-manager_module = load("manager")
+with mock.patch.dict(sys.modules, {"homeassistant.core": ha_core}):
+    manager_module = load("manager")
 engine_module = load("engine")
 
 
@@ -31,19 +41,54 @@ class Clock:
 
 
 class Bus:
-    def __init__(self): self.listeners = {}; self.unsubscribed = 0
-    def async_listen(self, kind, callback):
-        self.listeners[kind] = callback
+    """Model the relevant HassJob classification, not a direct-call fake.
+
+    Pinned HA 2026.8.1 core.py EventBus.async_listen builds HassJob(listener)
+    on registration. Coroutine functions are scheduled, @callback functions
+    run on-loop, and other synchronous functions execute in the executor.
+    helpers.event._async_track_event uses the same HassJob(action) rule.
+    """
+
+    def __init__(self, hass):
+        self.hass = hass
+        self.listeners = {}
+        self.job_types = {}
+        self.unsubscribed = self.executor_jobs = 0
+    def async_listen(self, kind, target):
+        self.listeners[kind] = target
+        self.job_types[kind] = (
+            "Coroutinefunction" if asyncio.iscoroutinefunction(target) else
+            "Callback" if getattr(target, "_hass_callback", False) is True else
+            "Executor"
+        )
         def remove():
             self.listeners.pop(kind, None)
+            self.job_types.pop(kind, None)
             self.unsubscribed += 1
         return remove
-    def emit(self, kind, data): self.listeners[kind](SimpleNamespace(data=data))
+    def emit(self, kind, data):
+        target, event = self.listeners[kind], SimpleNamespace(data=data)
+        if self.job_types[kind] == "Callback":
+            return target(event)
+        if self.job_types[kind] == "Coroutinefunction":
+            return self.hass.async_create_task(target(event))
+        self.executor_jobs += 1
+        return self.hass.loop.run_in_executor(None, target, event)
 
 
 class Hass:
-    def __init__(self): self.bus = Bus()
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
+        self.loop_thread_id = threading.get_ident()
+        self.non_loop_task_attempts = 0
+        self.bus = Bus(self)
     def async_create_task(self, coroutine, *, eager_start=False, name=None):
+        if threading.get_ident() != self.loop_thread_id:
+            self.non_loop_task_attempts += 1
+            # The real HA guard raises before scheduling. Close the rejected
+            # fixture coroutine so its expected rejection is warning-free.
+            coroutine.close()
+            raise RuntimeError("async_create_task from a thread other than the event loop")
         assert eager_start is False
         return asyncio.create_task(coroutine, name=name)
 
@@ -268,6 +313,88 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertEqual(self.manager.deadline, 131,
                          "A delayed task must not add its scheduling delay to the window")
+
+    async def test_event_callback_avoids_executor_and_reaches_motion(self):
+        self.settings["trigger_mode"] = "events"
+        self.manager._events = policy.EventAdmission(self.settings["event_filter"], "event_at", clock=self.clock)
+        await self.manager.start()
+        self.assertEqual(self.hass.bus.job_types["fixture_event"], "Callback")
+        self.assertIs(getattr(self.hass.bus.listeners["fixture_event"], "_hass_callback", None), True)
+        self.clock.now = 101
+        self.hass.bus.emit("fixture_event", {"entry_id": "selected", "event_key": "door_unlock_started", "event_at": 101})
+        await self.settle()
+        self.assertEqual(self.hass.bus.executor_jobs, 0)
+        self.assertEqual(self.hass.non_loop_task_attempts, 0)
+        self.assertEqual(self.manager.deadline, 131)
+        self.assertTrue(self.manager.motion)
+        self.assertTrue(self.onvif.motion)
+        self.assertEqual(self.consumer.open_calls, 1)
+
+    async def test_unmarked_event_callback_reproduces_guard_in_executor(self):
+        self.settings["trigger_mode"] = "events"
+        self.manager._events = policy.EventAdmission(self.settings["event_filter"], "event_at", clock=self.clock)
+        # Reproduce the pre-fix listener without changing its body. A direct-call
+        # fake would pass this listener and mask HA's real executor behavior.
+        with mock.patch.object(manager_module, "callback", lambda target: target):
+            await self.manager.start()
+        self.assertEqual(self.hass.bus.job_types["fixture_event"], "Executor")
+        self.clock.now = 101
+        rejected = self.hass.bus.emit("fixture_event", {
+            "entry_id": "selected", "event_key": "door_unlock_started", "event_at": 101,
+        })
+        with self.assertRaisesRegex(RuntimeError, "from a thread other than the event loop"):
+            await rejected
+        self.assertEqual(self.hass.bus.executor_jobs, 1)
+        self.assertEqual(self.hass.non_loop_task_attempts, 1)
+        self.assertEqual(self.manager.deadline, 0)
+        self.assertEqual(self.consumer.open_calls, 0)
+        self.assertFalse(self.manager.motion)
+
+    async def test_binary_sensor_callback_stays_on_loop_and_only_off_to_on_activates(self):
+        self.settings.update(trigger_mode="binary_sensor", binary_sensor="binary_sensor.fixture")
+        helper = ModuleType("homeassistant.helpers.event")
+        tracked = []
+        def track(hass, entity_ids, target):
+            tracked.append(entity_ids)
+            # The real helper constructs HassJob(action), just like EventBus.
+            return hass.bus.async_listen("fixture_state_changed", target)
+        helper.async_track_state_change_event = track
+        with mock.patch.dict(sys.modules, {"homeassistant.helpers.event": helper}):
+            await self.manager.start()
+        self.assertEqual(tracked, [["binary_sensor.fixture"]])
+        self.assertEqual(self.hass.bus.job_types["fixture_state_changed"], "Callback")
+        state = lambda value: None if value is None else SimpleNamespace(state=value)
+        for old, new in ((None, "on"), ("unavailable", "on"), ("unknown", "on"),
+                         ("off", "unavailable"), ("off", "unknown"), ("on", "on")):
+            self.hass.bus.emit("fixture_state_changed", {"old_state": state(old), "new_state": state(new)})
+        await self.settle()
+        self.assertEqual(self.consumer.open_calls, 0)
+        self.hass.bus.emit("fixture_state_changed", {
+            "old_state": state("off"), "new_state": state("on"),
+        })
+        await self.settle()
+        self.assertEqual(self.hass.bus.executor_jobs, 0)
+        self.assertEqual(self.hass.non_loop_task_attempts, 0)
+        self.assertEqual(self.manager.deadline, 130)
+        self.assertTrue(self.manager.motion)
+        self.assertEqual(self.consumer.open_calls, 1)
+
+    async def test_unmarked_sensor_callback_reproduces_helper_executor_guard(self):
+        self.settings.update(trigger_mode="binary_sensor", binary_sensor="binary_sensor.fixture")
+        helper = ModuleType("homeassistant.helpers.event")
+        helper.async_track_state_change_event = lambda hass, entities, target: hass.bus.async_listen("fixture_state_changed", target)
+        with mock.patch.dict(sys.modules, {"homeassistant.helpers.event": helper}), \
+                mock.patch.object(manager_module, "callback", lambda target: target):
+            await self.manager.start()
+        self.assertEqual(self.hass.bus.job_types["fixture_state_changed"], "Executor")
+        rejected = self.hass.bus.emit("fixture_state_changed", {
+            "old_state": SimpleNamespace(state="off"), "new_state": SimpleNamespace(state="on"),
+        })
+        with self.assertRaisesRegex(RuntimeError, "from a thread other than the event loop"):
+            await rejected
+        self.assertEqual(self.hass.non_loop_task_attempts, 1)
+        self.assertEqual(self.consumer.open_calls, 0)
+        self.assertFalse(self.manager.motion)
 
     async def test_stale_event_age_does_not_shorten_newer_activation(self):
         await self.live()
@@ -727,7 +854,7 @@ def load_integration_boundary():
     for leaf in ("const", "core", "exceptions"):
         imports["homeassistant." + leaf] = ModuleType("homeassistant." + leaf)
     imports["homeassistant.const"].EVENT_HOMEASSISTANT_STOP = "ha_stop"
-    imports["homeassistant.core"].callback = lambda callback: callback
+    imports["homeassistant.core"].callback = ha_callback
     for error in ("ConfigEntryNotReady", "ServiceValidationError"):
         setattr(imports["homeassistant.exceptions"], error, type(error, (Exception,), {}))
     spec = importlib.util.spec_from_file_location(name, BASE / "__init__.py", submodule_search_locations=[str(BASE)])

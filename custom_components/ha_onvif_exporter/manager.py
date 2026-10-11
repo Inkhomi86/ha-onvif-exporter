@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from homeassistant.core import callback
+
 from .const import (
     CONF_BINARY_SENSOR, CONF_CAMERA_ENTITY, CONF_EVENT_AT_FIELD, CONF_EVENT_FILTER,
     CONF_EVENT_TYPE, CONF_TRIGGER_MODE, CONF_WINDOW_SECONDS,
@@ -76,12 +78,14 @@ class ExportManager:
         self._started = True
         mode = self.settings[CONF_TRIGGER_MODE]
         if mode == TRIGGER_EVENTS:
+            @callback
             def event_received(event):
                 if self._events.accept(event.data):
                     self._task(self.async_activate(activation_at=time.monotonic()-self._events.last_age))
             self._unsubscribers.append(self.hass.bus.async_listen(self.settings[CONF_EVENT_TYPE], event_received))
         elif mode == TRIGGER_BINARY_SENSOR:
             from homeassistant.helpers.event import async_track_state_change_event
+            @callback
             def sensor_changed(event):
                 old, new = event.data.get("old_state"), event.data.get("new_state")
                 # No activation from startup, restored on, unknown or unavailable.
