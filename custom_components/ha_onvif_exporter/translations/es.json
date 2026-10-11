@@ -1,0 +1,123 @@
+{
+  "title": "HA ONVIF Exporter",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Exportar una cámara de Home Assistant",
+        "description": "Crea una cámara virtual ONVIF/RTSP autenticada. Solo podrán conectarse las IP indicadas. Esta integración no controla puertas físicas. Configura las mismas credenciales dedicadas en el grabador.",
+        "data": {
+          "camera_entity": "Cámara de Home Assistant",
+          "name": "Nombre de la cámara virtual",
+          "window_seconds": "Vídeo desde la última activación (segundos)",
+          "bind_ip": "Dirección IPv4 local de escucha",
+          "onvif_port": "Puerto HTTP de ONVIF",
+          "rtsp_port": "Puerto TCP de RTSP",
+          "username": "Usuario dedicado de ONVIF/RTSP",
+          "password": "Contraseña dedicada de ONVIF/RTSP",
+          "allowed_clients": "IPv4 de clientes permitidos, una por línea",
+          "trigger_mode": "Origen de la activación automática",
+          "event_type": "Nombre del evento de Home Assistant",
+          "event_filter": "Filtro de datos del evento",
+          "event_at_field": "Campo de fecha UTC en los datos del evento",
+          "binary_sensor": "Sensor binario que activa al pasar a encendido"
+        },
+        "data_description": {
+          "camera_entity": "Selecciona la cámara de su integración actual; no se necesitan credenciales nativas de la cámara.",
+          "bind_ip": "Una dirección exacta asignada a este Home Assistant. No se aceptan direcciones de escucha global.",
+          "onvif_port": "1986 es el puerto inicial de pruebas. No se puede utilizar un puerto ocupado.",
+          "rtsp_port": "18557 es el puerto inicial de pruebas. Debe ser distinto del puerto ONVIF.",
+          "password": "Usa una contraseña independiente ASCII imprimible de 16–128 caracteres. No reutilices la de Home Assistant ni la de la cámara.",
+          "allowed_clients": "Solo equipos IPv4 exactos: sin subredes, CIDR, comodines ni acceso anónimo.",
+          "trigger_mode": "El botón Activar está siempre disponible. Los modos Evento y Sensor binario también activan automáticamente.",
+          "event_filter": "Los campos planos se combinan con AND. Una lista de valores en un campo significa OR. Para BTicino, introduce explícitamente su entry_id y los event_key permitidos.",
+          "event_at_field": "Los eventos deben ser actuales; el exportador rechaza fechas antiguas y activaciones duplicadas.",
+          "binary_sensor": "Solo se utiliza en modo Sensor binario. Un estado restaurado o no disponible no es una activación."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigurar la cámara virtual",
+        "description": "Los cambios afectan solo a este exportador. La identidad del dispositivo virtual se conserva. Deja vacía la contraseña para mantenerla. Si cambias puertos o credenciales, actualiza el grabador.",
+        "data": {
+          "camera_entity": "Cámara de Home Assistant",
+          "name": "Nombre de la cámara virtual",
+          "window_seconds": "Vídeo desde la última activación (segundos)",
+          "bind_ip": "Dirección IPv4 local de escucha",
+          "onvif_port": "Puerto HTTP de ONVIF",
+          "rtsp_port": "Puerto TCP de RTSP",
+          "username": "Usuario dedicado de ONVIF/RTSP",
+          "password": "Nueva contraseña dedicada (vacía conserva la actual)",
+          "allowed_clients": "IPv4 de clientes permitidos, una por línea",
+          "trigger_mode": "Origen de la activación automática",
+          "event_type": "Nombre del evento de Home Assistant",
+          "event_filter": "Filtro de datos del evento",
+          "event_at_field": "Campo de fecha UTC en los datos del evento",
+          "binary_sensor": "Sensor binario que activa al pasar a encendido"
+        }
+      }
+    },
+    "error": {
+      "invalid_input": "Configuración no válida.",
+      "invalid_text": "Introduce un nombre no vacío de hasta 100 caracteres.",
+      "invalid_password": "Usa una contraseña dedicada ASCII imprimible de 16–128 caracteres.",
+      "invalid_username": "Usa entre 1 y 64 letras, números, puntos, guiones o guiones bajos.",
+      "invalid_ip": "Introduce una IPv4 exacta, no una dirección global, multicast ni una subred.",
+      "invalid_clients": "Introduce entre 1 y 32 IPv4 exactas, una por línea. No se permiten subredes ni comodines.",
+      "invalid_number": "Introduce un número entero dentro de los límites mostrados.",
+      "invalid_entity": "Selecciona una entidad del dominio camera o binary_sensor correspondiente.",
+      "entity_missing": "Esta entidad no existe en Home Assistant.",
+      "invalid_trigger": "Selecciona un modo de activación admitido.",
+      "invalid_event": "Usa un nombre de evento o de campo de fecha plano válido.",
+      "invalid_filter": "Usa un filtro plano pequeño con valores simples o listas no vacías de valores simples.",
+      "not_local_ip": "Home Assistant no puede escuchar en esta IPv4 local.",
+      "port_in_use": "Este puerto ya está ocupado. Elige un puerto libre.",
+      "cannot_bind": "Home Assistant no puede abrir este punto de escucha.",
+      "same_port": "ONVIF y RTSP deben usar puertos distintos.",
+      "entry_port_conflict": "Otra cámara virtual ya utiliza uno de estos puntos de escucha."
+    },
+    "abort": {"reconfigure_successful": "Cámara virtual reconfigurada. Su identidad no ha cambiado."}
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Ajustes de la cámara virtual",
+        "description": "Guardar recarga solo este exportador. Su identidad se conserva. Deja vacía la contraseña para mantenerla. Si cambias la dirección anunciada o las credenciales, actualiza el grabador.",
+        "data": {
+          "camera_entity": "Cámara de Home Assistant",
+          "name": "Nombre de la cámara virtual",
+          "window_seconds": "Vídeo desde la última activación (segundos)",
+          "bind_ip": "Dirección IPv4 local de escucha",
+          "onvif_port": "Puerto HTTP de ONVIF",
+          "rtsp_port": "Puerto TCP de RTSP",
+          "username": "Usuario dedicado de ONVIF/RTSP",
+          "password": "Nueva contraseña dedicada (vacía conserva la actual)",
+          "allowed_clients": "IPv4 de clientes permitidos, una por línea",
+          "trigger_mode": "Origen de la activación automática",
+          "event_type": "Nombre del evento de Home Assistant",
+          "event_filter": "Filtro de datos del evento",
+          "event_at_field": "Campo de fecha UTC en los datos del evento",
+          "binary_sensor": "Sensor binario que activa al pasar a encendido"
+        }
+      }
+    },
+    "error": {
+      "invalid_input": "Configuración no válida.",
+      "invalid_text": "Introduce un nombre no vacío de hasta 100 caracteres.",
+      "invalid_password": "Usa una contraseña dedicada ASCII imprimible de 16–128 caracteres.",
+      "invalid_username": "Usa entre 1 y 64 letras, números, puntos, guiones o guiones bajos.",
+      "invalid_ip": "Introduce una IPv4 exacta, no una dirección global, multicast ni una subred.",
+      "invalid_clients": "Introduce entre 1 y 32 IPv4 exactas, una por línea. No se permiten subredes ni comodines.",
+      "invalid_number": "Introduce un número entero dentro de los límites mostrados.",
+      "invalid_entity": "Selecciona una entidad del dominio camera o binary_sensor correspondiente.",
+      "entity_missing": "Esta entidad no existe en Home Assistant.",
+      "invalid_trigger": "Selecciona un modo de activación admitido.",
+      "invalid_event": "Usa un nombre de evento o de campo de fecha plano válido.",
+      "invalid_filter": "Usa un filtro plano pequeño con valores simples o listas no vacías de valores simples.",
+      "not_local_ip": "Home Assistant no puede escuchar en esta IPv4 local.",
+      "port_in_use": "Este puerto ya está ocupado. Elige un puerto libre.",
+      "cannot_bind": "Home Assistant no puede abrir este punto de escucha.",
+      "same_port": "ONVIF y RTSP deben usar puertos distintos.",
+      "entry_port_conflict": "Otra cámara virtual ya utiliza uno de estos puntos de escucha."
+    }
+  },
+  "selector": {"trigger_mode": {"options": {"manual": "Solo manual", "events": "Eventos de Home Assistant", "binary_sensor": "Sensor binario"}}}
+}

@@ -1,0 +1,20 @@
+activate:
+  name: Activate video export
+  description: Start or renew this exporter's own video window. Does not unlock a door.
+  fields:
+    entry_id:
+      name: Exporter configuration entry
+      required: true
+      selector:
+        config_entry:
+          integration: ha_onvif_exporter
+deactivate:
+  name: Stop video export
+  description: Close only this exporter's publisher and camera consumer.
+  fields:
+    entry_id:
+      name: Exporter configuration entry
+      required: true
+      selector:
+        config_entry:
+          integration: ha_onvif_exporter

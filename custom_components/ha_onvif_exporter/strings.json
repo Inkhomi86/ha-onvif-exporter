@@ -1,0 +1,133 @@
+{
+  "title": "HA ONVIF Exporter",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Export a Home Assistant camera",
+        "description": "Create one authenticated virtual ONVIF/RTSP camera. Only the listed IP addresses may connect. This integration does not control physical doors. Configure the same dedicated credentials in the recorder.",
+        "data": {
+          "camera_entity": "Home Assistant camera",
+          "name": "Virtual camera name",
+          "window_seconds": "Video window after the latest activation (seconds)",
+          "bind_ip": "Local IPv4 address to listen on",
+          "onvif_port": "ONVIF HTTP port",
+          "rtsp_port": "RTSP TCP port",
+          "username": "Dedicated ONVIF/RTSP username",
+          "password": "Dedicated ONVIF/RTSP password",
+          "allowed_clients": "Allowed client IPv4 addresses, one per line",
+          "trigger_mode": "Automatic activation source",
+          "event_type": "Home Assistant event name",
+          "event_filter": "Event data filter",
+          "event_at_field": "UTC timestamp field in event data",
+          "binary_sensor": "Binary sensor that activates on an on transition"
+        },
+        "data_description": {
+          "camera_entity": "Select the existing camera integration; no native camera credentials are needed.",
+          "bind_ip": "An exact address assigned to this Home Assistant host. Wildcard listeners are not accepted.",
+          "onvif_port": "1986 is the staging default. An occupied port cannot be used.",
+          "rtsp_port": "18557 is the staging default. A different port from ONVIF is required.",
+          "password": "Use a separate printable ASCII password, 16–128 characters. Do not reuse the Home Assistant or camera password.",
+          "allowed_clients": "Exact IPv4 hosts only; no subnet, CIDR, wildcard or anonymous access.",
+          "trigger_mode": "Manual always provides an Activate button. Event and binary-sensor modes also activate automatically.",
+          "event_filter": "Flat fields are combined with AND. A list of permitted values for one field means OR. For BTicino, enter its entry_id and permitted event_key values explicitly.",
+          "event_at_field": "Events must be current; the runtime rejects old timestamps and duplicate activations.",
+          "binary_sensor": "Used only in Binary sensor mode. A restored or unavailable state is not an activation."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure the virtual camera",
+        "description": "All changes apply to this exporter only. The virtual device identity stays fixed. Leave the password blank to keep it. If ports or credentials change, update the recorder settings.",
+        "data": {
+          "camera_entity": "Home Assistant camera",
+          "name": "Virtual camera name",
+          "window_seconds": "Video window after the latest activation (seconds)",
+          "bind_ip": "Local IPv4 address to listen on",
+          "onvif_port": "ONVIF HTTP port",
+          "rtsp_port": "RTSP TCP port",
+          "username": "Dedicated ONVIF/RTSP username",
+          "password": "New dedicated password (blank keeps the current password)",
+          "allowed_clients": "Allowed client IPv4 addresses, one per line",
+          "trigger_mode": "Automatic activation source",
+          "event_type": "Home Assistant event name",
+          "event_filter": "Event data filter",
+          "event_at_field": "UTC timestamp field in event data",
+          "binary_sensor": "Binary sensor that activates on an on transition"
+        }
+      }
+    },
+    "error": {
+      "invalid_input": "Invalid configuration.",
+      "invalid_text": "Enter a non-empty name of at most 100 characters.",
+      "invalid_password": "Use a printable ASCII dedicated password of 16–128 characters.",
+      "invalid_username": "Use 1–64 letters, numbers, dots, underscores or hyphens.",
+      "invalid_ip": "Enter one exact IPv4 address, not a wildcard, multicast address or subnet.",
+      "invalid_clients": "Enter 1–32 exact client IPv4 addresses, one per line. Subnets and wildcards are not allowed.",
+      "invalid_number": "Enter an integer within the displayed limits.",
+      "invalid_entity": "Select an entity from the required camera or binary_sensor domain.",
+      "entity_missing": "This entity does not exist in Home Assistant.",
+      "invalid_trigger": "Select a supported activation mode.",
+      "invalid_event": "Use a valid event name or flat timestamp field name.",
+      "invalid_filter": "Use a small flat filter with scalar values or non-empty lists of scalar values.",
+      "not_local_ip": "This IPv4 address cannot be bound on the Home Assistant host.",
+      "port_in_use": "This port is already in use. Choose a free port.",
+      "cannot_bind": "Home Assistant cannot bind this endpoint.",
+      "same_port": "ONVIF and RTSP must use different ports.",
+      "entry_port_conflict": "Another exporter entry already uses one of these endpoints."
+    },
+    "abort": {
+      "reconfigure_successful": "Virtual camera reconfigured. Its identity is unchanged."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Virtual camera settings",
+        "description": "Saving reloads this exporter only. Its identity remains unchanged. Leave the password blank to keep it. Changing the advertised endpoint or credentials requires updating the recorder.",
+        "data": {
+          "camera_entity": "Home Assistant camera",
+          "name": "Virtual camera name",
+          "window_seconds": "Video window after the latest activation (seconds)",
+          "bind_ip": "Local IPv4 address to listen on",
+          "onvif_port": "ONVIF HTTP port",
+          "rtsp_port": "RTSP TCP port",
+          "username": "Dedicated ONVIF/RTSP username",
+          "password": "New dedicated password (blank keeps the current password)",
+          "allowed_clients": "Allowed client IPv4 addresses, one per line",
+          "trigger_mode": "Automatic activation source",
+          "event_type": "Home Assistant event name",
+          "event_filter": "Event data filter",
+          "event_at_field": "UTC timestamp field in event data",
+          "binary_sensor": "Binary sensor that activates on an on transition"
+        }
+      }
+    },
+    "error": {
+      "invalid_input": "Invalid configuration.",
+      "invalid_text": "Enter a non-empty name of at most 100 characters.",
+      "invalid_password": "Use a printable ASCII dedicated password of 16–128 characters.",
+      "invalid_username": "Use 1–64 letters, numbers, dots, underscores or hyphens.",
+      "invalid_ip": "Enter one exact IPv4 address, not a wildcard, multicast address or subnet.",
+      "invalid_clients": "Enter 1–32 exact client IPv4 addresses, one per line. Subnets and wildcards are not allowed.",
+      "invalid_number": "Enter an integer within the displayed limits.",
+      "invalid_entity": "Select an entity from the required camera or binary_sensor domain.",
+      "entity_missing": "This entity does not exist in Home Assistant.",
+      "invalid_trigger": "Select a supported activation mode.",
+      "invalid_event": "Use a valid event name or flat timestamp field name.",
+      "invalid_filter": "Use a small flat filter with scalar values or non-empty lists of scalar values.",
+      "not_local_ip": "This IPv4 address cannot be bound on the Home Assistant host.",
+      "port_in_use": "This port is already in use. Choose a free port.",
+      "cannot_bind": "Home Assistant cannot bind this endpoint.",
+      "same_port": "ONVIF and RTSP must use different ports.",
+      "entry_port_conflict": "Another exporter entry already uses one of these endpoints."
+    }
+  },
+  "selector": {
+    "trigger_mode": {
+      "options": {
+        "manual": "Manual only",
+        "events": "Home Assistant events",
+        "binary_sensor": "Binary sensor"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.test-*/
+downloads/
+*.cjs
+install_hacs.py
+runtime/
+*.log

@@ -1,0 +1,13 @@
+{
+  "domain": "ha_onvif_exporter",
+  "name": "HA ONVIF Exporter",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/Inkhomi86/ha-onvif-exporter",
+  "issue_tracker": "https://github.com/Inkhomi86/ha-onvif-exporter/issues",
+  "codeowners": ["@Inkhomi86"],
+  "dependencies": ["camera", "network"],
+  "requirements": ["aiortc==1.15.0"],
+  "iot_class": "local_push",
+  "integration_type": "device"
+}
