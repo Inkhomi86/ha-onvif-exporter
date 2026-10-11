@@ -489,12 +489,12 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_after_first_mux_notifies_generic_but_exposes_safe_detail(self):
         await self.activate()
-        self.factory.process.stdout.send(b'{"error":"media_pipeline_decode_filter_mux"}\n')
+        self.factory.process.stdout.send(b'{"error":"media_pipeline_output_mux"}\n')
         await asyncio.sleep(0.02)
         self.assertEqual(self.events, ["worker_failed"])
-        self.assertEqual(self.media.failure_code, "media_pipeline_decode_filter_mux")
+        self.assertEqual(self.media.failure_code, "media_pipeline_output_mux")
         self.assertTrue(await self.media.stop_video())
-        self.assertEqual(self.media.failure_code, "media_pipeline_decode_filter_mux")
+        self.assertEqual(self.media.failure_code, "media_pipeline_output_mux")
 
     async def test_watchdog_exit_before_pipe_drain_keeps_detail(self):
         record = engine._Worker(asyncio.get_running_loop().create_future())

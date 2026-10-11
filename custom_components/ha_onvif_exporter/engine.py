@@ -43,7 +43,11 @@ WORKER_ERROR_CODES = frozenset({
     "config_password", "config_read", "video_track_count", "input_timestamp_missing",
     "input_timestamp_invalid", "input_timestamp_changed", "input_timestamp_regressed",
     "media_pipeline_source_open", "media_pipeline_output_open",
-    "media_pipeline_decode_filter_mux", "worker_internal",
+    "media_pipeline_source_demux", "media_pipeline_input_decode",
+    "media_pipeline_filter_create", "media_pipeline_filter_push", "media_pipeline_filter_pull",
+    "media_pipeline_output_encoder_config", "media_pipeline_output_encode",
+    "media_pipeline_output_mux", "media_pipeline_output_flush", "media_pipeline_progress_emit",
+    "worker_internal",
 })
 _ENV = {"LANG": "C.UTF-8", "TZ": "UTC"}
 

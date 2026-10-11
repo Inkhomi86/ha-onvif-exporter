@@ -30,7 +30,11 @@ WORKER_ERROR_CODES = frozenset({
     "config_password", "config_read", "video_track_count", "input_timestamp_missing",
     "input_timestamp_invalid", "input_timestamp_changed", "input_timestamp_regressed",
     "media_pipeline_source_open", "media_pipeline_output_open",
-    "media_pipeline_decode_filter_mux", "worker_internal",
+    "media_pipeline_source_demux", "media_pipeline_input_decode",
+    "media_pipeline_filter_create", "media_pipeline_filter_push", "media_pipeline_filter_pull",
+    "media_pipeline_output_encoder_config", "media_pipeline_output_encode",
+    "media_pipeline_output_mux", "media_pipeline_output_flush", "media_pipeline_progress_emit",
+    "worker_internal",
 })
 _SOURCE = re.compile(r"rtsp://127\.0\.0\.1:18554/(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2}){1,1024}\Z")
 _PASSWORD = re.compile(r"[a-z0-9]{64}\Z")
@@ -190,35 +194,54 @@ def run_pipeline(source_url, sink_url, should_stop, progress):
         stage = "output_open"
         output = av.open(sink_url, "w", format="rtsp", timeout=(1.0, 1.0),
                          options={"rtsp_transport": "tcp"})
+        stage = "output_encoder_config"
         encoded = configure_encoder(output)
-        stage = "decode_filter_mux"
         first_input_pts = previous_input_pts = None
         input_time_base = None
         missing_pts = 0
 
+        def staged_items(items, operation):
+            """Restore the operation before each potentially blocking next()."""
+            nonlocal stage
+            stage = operation
+            iterator = iter(items)
+            while True:
+                stage = operation
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+                yield item
+
         def emit(filtered):
-            nonlocal frames, packets
+            nonlocal frames, packets, stage
             if should_stop():
                 return False
+            stage = "output_encode"
             filtered.pts = frames
             filtered.time_base = Fraction(1, RATE)
             current = frames
             frames += 1
             muxed = False
-            for packet in encoded.encode(filtered):
+            produced = encoded.encode(filtered)
+            for packet in staged_items(produced, "output_encode"):
                 if should_stop():
                     return False
+                stage = "output_mux"
                 output.mux(packet)
                 packets += 1
                 muxed = True
             if muxed:
+                stage = "progress_emit"
                 progress({"event": "progress", "frame": frames, "packets": packets,
                           "out_time_us": (current + 1) * 1000000 // RATE})
             return True
 
         def drain():
+            nonlocal stage
             while not should_stop():
                 try:
+                    stage = "filter_pull"
                     filtered = graph.pull()
                 except (av.error.BlockingIOError, av.error.EOFError):
                     return True
@@ -226,10 +249,14 @@ def run_pipeline(source_url, sink_url, should_stop, progress):
                     return False
             return False
 
-        for packet in source.demux(input_stream):
+        stage = "source_demux"
+        incoming = source.demux(input_stream)
+        for packet in staged_items(incoming, "source_demux"):
             if should_stop():
                 break
-            for frame in packet.decode():
+            stage = "input_decode"
+            decoded = packet.decode()
+            for frame in staged_items(decoded, "input_decode"):
                 if should_stop():
                     break
                 if frame.pts is None or frame.time_base is None:
@@ -251,16 +278,22 @@ def run_pipeline(source_url, sink_url, should_stop, progress):
                 previous_input_pts = frame.pts
                 frame.pts -= first_input_pts
                 if graph is None:
+                    stage = "filter_create"
                     graph = normalization_graph(av, frame)
+                stage = "filter_push"
                 graph.push(frame)
                 if not drain():
                     break
         # No buffered frame flushing after the parent closes the export window.
         if graph is not None and not should_stop():
+            stage = "filter_push"
             graph.push(None)
             drain()
         if not should_stop():
-            for packet in encoded.encode(None):
+            stage = "output_flush"
+            flushed = encoded.encode(None)
+            for packet in staged_items(flushed, "output_flush"):
+                stage = "output_mux"
                 output.mux(packet)
                 packets += 1
         return {"event": "finished", "frames": frames, "packets": packets,

@@ -165,13 +165,107 @@ class PipelineTests(unittest.TestCase):
     def test_mux_error_redacted_no_progress(self):
         with self.assertRaises(worker.WorkerError) as caught:
             self.pipeline([9000], fail_mux=True)
-        self.assertEqual(str(caught.exception), "media_pipeline_decode_filter_mux")
+        self.assertEqual(str(caught.exception), "media_pipeline_output_mux")
 
     def test_stop_no_buffer_flush(self):
         result, progress, output, _ = self.pipeline([9000, 15000, 21000], stop_after_first=True)
         self.assertEqual(result["outcome"], "stopped")
         self.assertEqual(output.mux.call_count, 1)
         self.assertEqual(len(progress), 1)
+
+
+class OperationDiagnosticTests(unittest.TestCase):
+    def failure_at(self, operation, *, late=False):
+        private = "rtsp://user:PRIVATE_PASSWORD@192.0.2.1/path"
+        def fail():
+            raise RuntimeError(private)
+        class Blocked(Exception): pass
+        class End(Exception): pass
+        frame = SimpleNamespace(pts=9000, time_base=Fraction(1, 90000))
+        def decode():
+            if operation == "input_decode" and not late:
+                fail()
+            yield frame
+            if operation == "input_decode" and late:
+                fail()
+        packet = SimpleNamespace(decode=decode)
+        def demux(_stream):
+            if operation == "source_demux" and not late:
+                fail()
+            yield packet
+            if operation == "source_demux" and late:
+                fail()
+        source, output = mock.Mock(), mock.Mock()
+        source.streams.video = [SimpleNamespace(codec_context=SimpleNamespace(thread_count=0))]
+        source.demux.side_effect = demux
+        if operation == "output_mux":
+            output.mux.side_effect = fail
+        class Graph:
+            def __init__(self): self.frames = []
+            def push(self, item):
+                if operation == "filter_push": fail()
+                if item is not None: self.frames.append(item)
+            def pull(self):
+                if operation == "filter_pull": fail()
+                if not self.frames: raise Blocked()
+                return self.frames.pop(0)
+        def create_graph(_av, _frame):
+            if operation == "filter_create": fail()
+            return Graph()
+        def encode(item):
+            if item is None:
+                if operation == "output_flush": fail()
+                return []
+            def packets():
+                if operation == "output_encode" and not late: fail()
+                yield object()
+                if operation == "output_encode" and late: fail()
+            return packets()
+        encoder = SimpleNamespace(encode=encode)
+        def configure(_container):
+            if operation == "output_encoder_config": fail()
+            return encoder
+        def open_container(_url, mode, **_kwargs):
+            if mode == "r" and operation == "source_open": fail()
+            if mode == "w" and operation == "output_open": fail()
+            return source if mode == "r" else output
+        fake_av = SimpleNamespace(open=open_container, error=SimpleNamespace(BlockingIOError=Blocked, EOFError=End))
+        progress = []
+        def record_progress(data):
+            if operation == "progress_emit": fail()
+            progress.append(data)
+        with (mock.patch.object(worker, "silent_av", return_value=fake_av),
+              mock.patch.object(worker, "configure_encoder", side_effect=configure),
+              mock.patch.object(worker, "normalization_graph", side_effect=create_graph)):
+            with self.assertRaises(worker.WorkerError) as caught:
+                worker.run_pipeline("rtsp://127.0.0.1:18554/camera", "rtsp://127.0.0.1:18557/standby",
+                                    lambda: False, record_progress)
+        self.assertEqual(str(caught.exception), "media_pipeline_" + operation)
+        self.assertNotIn(private, str(caught.exception))
+        self.assertIn(str(caught.exception), worker.WORKER_ERROR_CODES)
+        return progress, output.mux.call_count
+
+    def test_each_operation_emits_its_own_fixed_enum(self):
+        for operation in ("source_open", "output_open", "source_demux", "input_decode",
+                          "filter_create", "filter_push", "filter_pull", "output_encoder_config",
+                          "output_encode", "output_mux", "output_flush", "progress_emit"):
+            with self.subTest(operation=operation):
+                self.failure_at(operation)
+
+    def test_late_demux_failure_not_attributed_to_previous_mux(self):
+        progress, muxes = self.failure_at("source_demux", late=True)
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(muxes, 1)
+
+    def test_late_decode_failure_not_attributed_to_previous_filter(self):
+        progress, muxes = self.failure_at("input_decode", late=True)
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(muxes, 1)
+
+    def test_late_encode_failure_not_attributed_to_previous_mux(self):
+        progress, muxes = self.failure_at("output_encode", late=True)
+        self.assertEqual(progress, [])
+        self.assertEqual(muxes, 1)
 
 
 class DiagnosticTests(unittest.TestCase):
