@@ -10,6 +10,7 @@ from .const import (
     TRIGGER_BINARY_SENSOR, TRIGGER_EVENTS,
 )
 from .policy import EventAdmission
+from .engine import WORKER_ERROR_CODES
 
 
 class ExportManager:
@@ -48,6 +49,10 @@ class ExportManager:
             except Exception:
                 # A detached/broken entity must never interrupt media cleanup.
                 pass
+
+    def _media_failure(self, fallback):
+        code = getattr(self.engine, "failure_code", None)
+        return code if type(code) is str and code in WORKER_ERROR_CODES | {"worker_failed", "server_failed"} else fallback
 
     def _task(self, coro):
         task = self.hass.async_create_task(coro, eager_start=False)
@@ -115,6 +120,7 @@ class ExportManager:
                 return
             self.status = "starting"
             self._notify()
+            publisher_attempted = False
             try:
                 info = await self.consumer.open(self.settings[CONF_CAMERA_ENTITY])
                 if self.deadline <= time.monotonic() or self._closing or not self.enabled:
@@ -123,6 +129,7 @@ class ExportManager:
                 if info.source is None:
                     raise RuntimeError("managed_source_required")
                 self.engine.extend_deadline(self.deadline)
+                publisher_attempted = True
                 await self.engine.start_video(info.source)
                 if self.deadline <= time.monotonic() or self._closing or not self.enabled:
                     await self._close_owned()
@@ -138,6 +145,8 @@ class ExportManager:
                 self.error_code = "activation_failed"
                 self.deadline = 0
                 await self._close_owned()
+                if publisher_attempted and not self._poisoned:
+                    self.error_code = self._media_failure("activation_failed")
                 self.status = "fault"
                 self._notify()
 
@@ -199,12 +208,16 @@ class ExportManager:
                 except Exception:
                     self.deadline = 0
                     await self._close_owned()
-                    self.status, self.error_code = "fault", "activation_failed"
+                    self.status = "fault"
+                    if not self._poisoned:
+                        self.error_code = self._media_failure("activation_failed")
                 self._notify()
                 return
             await self._close_owned()
             if reason not in {"expired", "manual", "disabled", "shutdown"}:
-                self.status, self.error_code = "fault", reason
+                self.status = "fault"
+                if not self._poisoned:
+                    self.error_code = self._media_failure(reason) if reason in {"worker_failed", "server_failed"} else reason
                 self._notify()
         if not clear and self.deadline > time.monotonic() and not self._poisoned and not self._closing:
             self.engine.extend_deadline(self.deadline)

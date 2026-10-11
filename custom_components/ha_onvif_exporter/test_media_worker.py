@@ -139,7 +139,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([item["frame"] for item in progress], [1, 2])
         self.assertEqual(output.mux.call_count, 2)
         self.assertEqual(av.open.call_args_list[0].kwargs["options"]["allowed_media_types"], "video")
-        self.assertEqual(av.open.call_args_list[0].kwargs["timeout"], (1.0, 1.0))
+        self.assertEqual(av.open.call_args_list[0].kwargs["timeout"], (1.0, 4.0))
+        self.assertEqual(av.open.call_args_list[1].kwargs["timeout"], (1.0, 1.0))
 
     def test_missing_pts_30_bound(self):
         result, progress, _, _ = self.pipeline([9000] + [None] * 30 + [195000])
@@ -171,6 +172,60 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "stopped")
         self.assertEqual(output.mux.call_count, 1)
         self.assertEqual(len(progress), 1)
+
+
+class DiagnosticTests(unittest.TestCase):
+    payload = ConfigTests.payload
+    def execute(self, error=None, *, argv=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        def pipeline(_source, _sink, _stop, progress):
+            if error is not None:
+                raise error
+            progress({"frame": 7})
+        with (mock.patch.object(worker.sys, "argv", argv or ["media_worker.py"]),
+              mock.patch.object(worker.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(self.payload()))),
+              mock.patch.object(worker.sys, "stdout", stdout), mock.patch.object(worker.sys, "stderr", stderr),
+              mock.patch.object(worker.signal, "signal"), mock.patch.object(worker, "run_pipeline", side_effect=pipeline)):
+            result = worker.main()
+        self.assertEqual(stderr.getvalue(), "")
+        return result, stdout.getvalue()
+
+    def test_each_allowed_error_is_exact_fixed_protocol_only(self):
+        for code in worker.WORKER_ERROR_CODES:
+            with self.subTest(code=code):
+                status, output = self.execute(worker.WorkerError(code))
+                self.assertEqual(status, 1)
+                self.assertEqual(json.loads(output), {"error": code})
+                self.assertEqual(len(output.splitlines()), 1)
+
+    def test_unknown_or_multifield_errors_cannot_leak(self):
+        private = "rtsp://user:PRIVATE_PASSWORD@192.0.2.1/path"
+        for error in (RuntimeError(private), worker.WorkerError(private), worker.WorkerError(),
+                      worker.WorkerError("config_sink", private), worker.WorkerError({"url": private}),
+                      worker.WorkerError([private])):
+            with self.subTest(error_type=type(error).__name__):
+                status, output = self.execute(error)
+                self.assertEqual(status, 1)
+                self.assertEqual(json.loads(output), {"error": "worker_internal"})
+                self.assertNotIn(private, output)
+
+    def test_success_progress_protocol_unchanged(self):
+        status, output = self.execute()
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output), {"frames": 7})
+
+    def test_arguments_diagnostic_does_not_emit_argument_values(self):
+        status, output = self.execute(argv=["media_worker.py", "PRIVATE_PASSWORD"])
+        self.assertEqual(status, 2)
+        self.assertEqual(json.loads(output), {"error": "arguments"})
+        self.assertNotIn("PRIVATE_PASSWORD", output)
+
+    def test_closed_stdout_is_silent(self):
+        stream = mock.Mock(write=mock.Mock(side_effect=BrokenPipeError("PRIVATE_PASSWORD")))
+        stderr = io.StringIO()
+        with mock.patch.object(worker.sys, "stdout", stream), mock.patch.object(worker.sys, "stderr", stderr):
+            worker.emit_error("config_sink")
+        self.assertEqual(stderr.getvalue(), "")
 
 
 @unittest.skipUnless(importlib.util.find_spec("av"), "optional existing local PyAV runtime")

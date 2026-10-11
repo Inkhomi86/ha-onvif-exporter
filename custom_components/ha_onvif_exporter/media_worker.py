@@ -22,6 +22,16 @@ VERSIONS = frozenset({"17.0.1", "19.0.1"})
 SIZE = (1920, 1080)
 RATE = 30
 MAX_CONFIG = 8192
+# Closed diagnostic protocol. Keep synchronized with engine.WORKER_ERROR_CODES;
+# never stringify an arbitrary exception or send libav's retained details.
+WORKER_ERROR_CODES = frozenset({
+    "arguments", "pyav_version", "encoder_missing", "filters_missing", "url_shape",
+    "config_bound", "config_schema", "config_source", "config_sink", "config_user",
+    "config_password", "config_read", "video_track_count", "input_timestamp_missing",
+    "input_timestamp_invalid", "input_timestamp_changed", "input_timestamp_regressed",
+    "media_pipeline_source_open", "media_pipeline_output_open",
+    "media_pipeline_decode_filter_mux", "worker_internal",
+})
 _SOURCE = re.compile(r"rtsp://127\.0\.0\.1:18554/(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2}){1,1024}\Z")
 _PASSWORD = re.compile(r"[a-z0-9]{64}\Z")
 
@@ -167,7 +177,10 @@ def run_pipeline(source_url, sink_url, should_stop, progress):
     frames = packets = 0
     stage = "source_open"
     try:
-        source = av.open(source_url, "r", format="rtsp", timeout=(1.0, 1.0),
+        # Verified HA RTSP first decoded frames needed more than one second;
+        # bound reads to four seconds, retaining a one-second connect timeout.
+        # The independent parent watchdog still owns the full export deadline.
+        source = av.open(source_url, "r", format="rtsp", timeout=(1.0, 4.0),
                          options={"rtsp_transport": "tcp", "allowed_media_types": "video"})
         videos = list(source.streams.video)
         if len(videos) != 1:
@@ -265,12 +278,22 @@ def run_pipeline(source_url, sink_url, should_stop, progress):
                     pass
 
 
+def emit_error(code):
+    """Exactly one safe protocol line, never stderr/raw exception strings."""
+    if type(code) is not str or code not in WORKER_ERROR_CODES:
+        code = "worker_internal"
+    try:
+        print(json.dumps({"error": code}), flush=True)
+    except Exception:
+        pass  # A closed owning pipe must not cause a traceback or fallback log.
+
+
 def main():
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     if len(sys.argv) != 1:
-        print(json.dumps({"code": "arguments"}), file=sys.stderr, flush=True)
+        emit_error("arguments")
         return 2
     try:
         config = stdin_config(sys.stdin.buffer)
@@ -278,10 +301,10 @@ def main():
                      lambda data: print(json.dumps({"frames": data["frame"]}), flush=True))
         return 0
     except WorkerError as error:
-        print(json.dumps({"code": error.args[0]}), file=sys.stderr, flush=True)
+        emit_error(error.args[0] if len(error.args) == 1 else "worker_internal")
         return 1
     except Exception:
-        print(json.dumps({"code": "worker_internal"}), file=sys.stderr, flush=True)
+        emit_error("worker_internal")
         return 1
 
 

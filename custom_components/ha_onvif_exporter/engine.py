@@ -37,6 +37,14 @@ _SOURCE = re.compile(r"rtsp://127\.0\.0\.1:18554/(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{
 _ENTRY = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _USER = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 _CALLBACK_CODES = frozenset({"expired", "worker_failed", "server_failed"})
+WORKER_ERROR_CODES = frozenset({
+    "arguments", "pyav_version", "encoder_missing", "filters_missing", "url_shape",
+    "config_bound", "config_schema", "config_source", "config_sink", "config_user",
+    "config_password", "config_read", "video_track_count", "input_timestamp_missing",
+    "input_timestamp_invalid", "input_timestamp_changed", "input_timestamp_regressed",
+    "media_pipeline_source_open", "media_pipeline_output_open",
+    "media_pipeline_decode_filter_mux", "worker_internal",
+})
 _ENV = {"LANG": "C.UTF-8", "TZ": "UTC"}
 
 
@@ -180,6 +188,7 @@ class _Worker:
     stopping: bool = False
     notice: str | None = None
     frames: int = 0
+    failure_code: str | None = None
 
 
 class MediaEngine:
@@ -210,6 +219,7 @@ class MediaEngine:
         self._worker: _Worker | None = None
         self._deadline = 0.0
         self._fault = False
+        self._failure_code: str | None = None
         self._stopping = False
         self._closed = False
         self._server_notified = False
@@ -236,6 +246,12 @@ class MediaEngine:
     def deadline(self) -> float:
         with self._lock:
             return self._deadline
+
+    @property
+    def failure_code(self) -> str | None:
+        """Latest closed diagnostic enum; persists through cleanup until mux."""
+        with self._lock:
+            return self._failure_code
 
     def set_callback(self, callback: Callable[[str], Any]) -> None:
         if not callable(callback):
@@ -397,6 +413,8 @@ class MediaEngine:
             return False
 
     def _stop_record_locked(self, record: _Worker, code: str) -> None:
+        if record is self._worker and code in {"worker_failed", "server_failed"}:
+            self._failure_code = record.failure_code if code == "worker_failed" and record.failure_code else code
         record.stopping = True
         if record.process is not None:
             self._kill_locked(record.process)
@@ -454,6 +472,23 @@ class MediaEngine:
                         result[key] = value
                     return result
                 data = json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=unique)
+                if isinstance(data, dict) and set(data) == {"error"}:
+                    error = data["error"]
+                    if type(error) is not str or error not in WORKER_ERROR_CODES:
+                        raise EngineError("worker_failed")
+                    with self._lock:
+                        if record is not self._worker or self._stopping:
+                            return
+                        # An exited child can be noticed by the watchdog before
+                        # its pipe is drained. Accept only its diagnostic then;
+                        # never replace expiry/manual shutdown with a late error.
+                        if record.stopping and record.notice != "worker_failed":
+                            return
+                        record.failure_code = error
+                        self._failure_code = error
+                        self._stop_record_locked(record, "worker_failed")
+                    self._notify_record(record, "worker_failed")
+                    return
                 frames = data.get("frames") if isinstance(data, dict) else None
                 if not isinstance(data, dict) or set(data) != {"frames"} or type(frames) is not int or not 0 < frames < 2**53:
                     raise EngineError("worker_failed")
@@ -467,6 +502,7 @@ class MediaEngine:
                         raise EngineError("worker_failed")
                     else:
                         record.frames = frames
+                        self._failure_code = None
                         self._finish_ready(record)
                         notice = None
                 if notice:
@@ -510,6 +546,7 @@ class MediaEngine:
                 return
             if self._server is not None and self._server.poll() is not None:
                 self._fault = True
+                self._failure_code = "server_failed"
                 if self._worker is not None:
                     self._stop_record_locked(self._worker, "server_failed")
                 if not self._server_notified:

@@ -103,6 +103,12 @@ class Factory:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_worker_and_engine_diagnostic_allowlists_are_identical(self):
+        spec = importlib.util.spec_from_file_location("worker_codes_review", COMPONENT / "media_worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        self.assertEqual(engine.WORKER_ERROR_CODES, worker.WORKER_ERROR_CODES)
+
     def test_precise_roles_peer_acl_and_no_extra_listeners(self):
         validated = engine.validate_settings(settings())
         config = engine.media_config(validated, "a" * 64, Path("/config/private/standby.mp4"))
@@ -444,6 +450,94 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.media.deadline, 0)
             self.assertTrue(getattr(self.media, attribute))
             setattr(self.media, attribute, False)
+
+    async def test_fixed_worker_error_is_not_readiness_and_survives_cleanup(self):
+        for code in engine.WORKER_ERROR_CODES:
+            with self.subTest(code=code):
+                factory = Factory(initial=json.dumps({"error": code}).encode() + b"\n")
+                other = engine.MediaEngine(self.hass, "diagnostic", settings(), popen=factory, clock=self.clock,
+                                           open_timeout=0.2, reap_timeout=0.1)
+                other._loop, other._runtime, other._server = asyncio.get_running_loop(), self.media._runtime, Process()
+                other.extend_deadline(130)
+                with self.assertRaises(engine.EngineError) as caught:
+                    await other.start_video(SOURCE)
+                self.assertEqual(str(caught.exception), "worker_failed")
+                self.assertEqual(other.frames, 0)
+                self.assertEqual(other.failure_code, code)
+                self.assertIsNone(other._worker)
+                self.assertTrue(await other.stop())
+                self.assertEqual(other.failure_code, code)
+
+    async def test_malformed_or_unapproved_worker_error_never_becomes_detail(self):
+        private = "rtsp://user:PRIVATE_PASSWORD@192.0.2.1/path"
+        lines = [json.dumps(value).encode() + b"\n" for value in
+                 ({"error": private}, {"error": True}, {"error": [private]},
+                  {"error": "worker_internal", "frames": 1}, {"error": "config_sink", "url": private})]
+        lines.extend((b'{"error":"config_sink","error":"config_read"}\n', b'\xff\n', b'x' * 257))
+        for raw in lines:
+            with self.subTest(line_size=len(raw)):
+                factory = Factory(initial=raw)
+                other = engine.MediaEngine(self.hass, "invalid_diagnostic", settings(), popen=factory, clock=self.clock,
+                                           open_timeout=0.2, reap_timeout=0.1)
+                other._loop, other._runtime, other._server = asyncio.get_running_loop(), self.media._runtime, Process()
+                other.extend_deadline(130)
+                with self.assertRaises(engine.EngineError):
+                    await other.start_video(SOURCE)
+                self.assertEqual(other.failure_code, "worker_failed")
+                self.assertEqual(other.frames, 0)
+                self.assertTrue(await other.stop())
+
+    async def test_error_after_first_mux_notifies_generic_but_exposes_safe_detail(self):
+        await self.activate()
+        self.factory.process.stdout.send(b'{"error":"media_pipeline_decode_filter_mux"}\n')
+        await asyncio.sleep(0.02)
+        self.assertEqual(self.events, ["worker_failed"])
+        self.assertEqual(self.media.failure_code, "media_pipeline_decode_filter_mux")
+        self.assertTrue(await self.media.stop_video())
+        self.assertEqual(self.media.failure_code, "media_pipeline_decode_filter_mux")
+
+    async def test_watchdog_exit_before_pipe_drain_keeps_detail(self):
+        record = engine._Worker(asyncio.get_running_loop().create_future())
+        record.ready.add_done_callback(lambda future: future.exception())
+        record.process = Process()
+        record.process.returncode = 1
+        record.process.stdout.send(b'{"error":"media_pipeline_source_open"}\n')
+        record.spawn_done.set()
+        self.media._worker = record
+        self.media.extend_deadline(130)
+        self.media._watchdog_once()
+        self.assertEqual(self.media.failure_code, "worker_failed")
+        self.media._read_progress(record)
+        await asyncio.sleep(0)
+        self.assertEqual(self.media.failure_code, "media_pipeline_source_open")
+        self.assertEqual(self.events, ["worker_failed"])
+        self.assertTrue(await self.media.stop_video())
+
+    async def test_next_real_mux_clears_prior_detail_not_new_attempt_alone(self):
+        self.factory.initial = b'{"error":"media_pipeline_source_open"}\n'
+        self.media.extend_deadline(130)
+        with self.assertRaises(engine.EngineError):
+            await self.media.start_video(SOURCE)
+        self.assertEqual(self.media.failure_code, "media_pipeline_source_open")
+        self.factory = Factory(initial=None)
+        self.media._popen = self.factory
+        self.media.extend_deadline(130)
+        task = asyncio.create_task(self.media.start_video(SOURCE))
+        await self.wait_spawn()
+        self.assertEqual(self.media.failure_code, "media_pipeline_source_open")
+        self.factory.process.stdout.send(b'{"frames":1}\n')
+        await task
+        self.assertIsNone(self.media.failure_code)
+
+    async def test_expiry_does_not_become_error_from_late_child_output(self):
+        await self.activate()
+        record = self.media._worker
+        self.clock.now = 130
+        self.media._watchdog_once()
+        record.process.stdout.send(b'{"error":"media_pipeline_source_open"}\n')
+        await asyncio.sleep(0.02)
+        self.assertEqual(self.events, ["expired"])
+        self.assertIsNone(self.media.failure_code)
 
 
 if __name__ == "__main__":

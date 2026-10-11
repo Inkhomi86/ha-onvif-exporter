@@ -287,6 +287,33 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.status, "fault")
         self.assertFalse(self.consumer.active)
 
+    async def test_worker_diagnostic_is_safe_and_survives_cleanup(self):
+        self.engine.fail_start_video = True
+        self.engine.failure_code = "media_pipeline_source_open"
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.assertEqual(self.manager.error_code, "media_pipeline_source_open")
+        self.assertFalse(self.consumer.active)
+
+    async def test_worker_unknown_diagnostic_is_not_exposed(self):
+        self.engine.fail_start_video = True
+        self.engine.failure_code = "not-a-public-code"
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.assertEqual(self.manager.error_code, "activation_failed")
+        self.assertEqual(self.manager.status, "fault")
+        self.assertFalse(self.consumer.active)
+
+    async def test_worker_fault_cannot_hide_cleanup_failure(self):
+        await self.live()
+        self.engine.cleanup_confirmed = False
+        self.engine.failure_code = "media_pipeline_decode_filter_mux"
+        await self.manager._finish("worker_failed", clear=True)
+        self.assertEqual(self.manager.error_code, "publisher_cleanup_unconfirmed")
+        self.assertTrue(self.manager._poisoned)
+
     async def test_consumer_failure_falls_back_to_standby_no_reactivation(self):
         await self.live()
         self.consumer.closed.set()

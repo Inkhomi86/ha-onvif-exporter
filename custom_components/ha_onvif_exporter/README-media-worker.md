@@ -12,9 +12,10 @@ fixed `window_publisher` and password is generated `[a-z0-9]{64}`. Publish path 
 fixed `/standby`. URLs and secrets remain in child memory and stdin, not argv.
 
 Launch with an exact owned subprocess handle, stderr=DEVNULL, private stdin,
-and a bounded stdout parser. Worker stdout is only `{"frames": N}` after a
-successful packet mux. This is the readiness barrier, NOT Popen/HA SDP answer.
-Worker errors are controlled codes only. Do not emit libav exception strings.
+and a bounded stdout parser. Worker stdout is `{"frames": N}` after a
+successful packet mux, or `{"error": "fixed_enum"}` from a closed allowlist.
+Only packet mux is the readiness barrier, NOT Popen/HA SDP answer or an error.
+Do not emit libav exception strings, URLs, arguments, or credentials.
 
 Pipeline: video-only TCP RTSP decode -> scale/pad preserving aspect ratio ->
 square pixels -> fps30 -> yuv420p -> libx264 Main1920x1080/30, GOP10, no B-frames,
@@ -26,7 +27,8 @@ worker opens the alias. It owns the last-activation+30s deadline, external
 watchdog, termination/reap, and fallback STANDBY. Kill/reap this reader BEFORE
 closing that WebRTC reference. SIGTERM is a cooperative stop flag, not a hard
 guarantee against blocked libav I/O; use a bounded grace followed by exact-child
-kill/reap. Libav open/read/mux operations have1s network timeouts. There are no
+kill/reap. Source connection has a1s timeout and source reading a4s timeout;
+output operations remain bounded to1s. There are no
 native API calls, unlocks, callback registration, retries, or renewals here.
 
 Existing-source PTS are preserved relative to the first valid timestamp. Up to

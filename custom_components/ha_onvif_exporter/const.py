@@ -1,7 +1,7 @@
 """Configuration contract for HA ONVIF Exporter."""
 
 DOMAIN = "ha_onvif_exporter"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 CONF_CAMERA_ENTITY = "camera_entity"
 CONF_NAME = "name"
