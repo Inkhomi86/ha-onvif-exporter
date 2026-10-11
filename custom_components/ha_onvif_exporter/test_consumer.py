@@ -268,9 +268,12 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_begin_startup_timeout_without_waiter_retains_reference(self):
         self.backend.auto_frame = False
-        self.consumer = Consumer(None, backend=self.backend, open_timeout=.035, frame_timeout=1)
+        # Leave negotiation enough headroom for Windows' 15.625ms loop clock.
+        # This case tests expiry AFTER begin without a frame waiter, not whether
+        # the fake peer can negotiate inside a sub-resolution startup budget.
+        self.consumer = Consumer(None, backend=self.backend, open_timeout=.15, frame_timeout=1)
         info = await self.consumer.begin("camera.test")
-        self.assertEqual(await asyncio.wait_for(self.consumer.wait_failure(), .2), "open_timeout")
+        self.assertEqual(await asyncio.wait_for(self.consumer.wait_failure(), .5), "open_timeout")
         self.assertEqual(self.backend.camera.closed_ids, [])
         self.assertEqual(self.backend.peers[0].close_count, 0)
         self.assertFalse(self.consumer.frame_ready)
