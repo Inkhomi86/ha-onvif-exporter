@@ -115,6 +115,14 @@ work around failure by enabling anonymous media access or widening the allowlist
 Media timeout, worker exit or unconfirmed cleanup prevents further unsafe
 activation and must be resolved before using recordings.
 
+HA's administrator diagnostics download includes safe runtime counts: active
+ONVIF subscriptions, successful prepared responses and motion notifications
+included in PullPoint responses. These counts do not identify clients or prove
+that a recorder received a response or recorded a clip. They reset when the
+exporter reloads. Integration diagnostics omit configuration, credentials,
+camera/client addresses, subscription tokens and media; HA adds its normal
+framework metadata separately.
+
 Report a sanitized error code, HA version, architecture and trigger mode in
 [Issues](https://github.com/Inkhomi86/ha-onvif-exporter/issues). Do not upload
 passwords, raw SDP, camera URLs containing credentials, configuration dumps,

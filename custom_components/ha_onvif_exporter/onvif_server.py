@@ -67,6 +67,27 @@ MAX_SNAPSHOT = 2 * 1024 * 1024
 FRESHNESS = 300.0
 MAX_FUTURE = 30.0
 CACHE_RETENTION = 331.0
+MAX_DIAGNOSTIC_COUNT = (1 << 53) - 1
+# Closed operation names only. No client-supplied name, ID, URL or credentials
+# ever become a diagnostic dictionary key or value.
+_DIAGNOSTIC_OPERATIONS = {
+    qname: name for qname, name in (
+        ("{" + DEVICE + "}GetSystemDateAndTime", "device_get_system_date_and_time"),
+        ("{" + DEVICE + "}GetCapabilities", "device_get_capabilities"),
+        ("{" + DEVICE + "}GetServices", "device_get_services"),
+        ("{" + DEVICE + "}GetServiceCapabilities", "device_get_service_capabilities"),
+        ("{" + MEDIA + "}GetProfiles", "media_get_profiles"),
+        ("{" + MEDIA + "}GetStreamUri", "media_get_stream_uri"),
+        ("{" + MEDIA + "}GetServiceCapabilities", "media_get_service_capabilities"),
+        ("{" + EVENTS + "}GetServiceCapabilities", "events_get_service_capabilities"),
+        ("{" + EVENTS + "}GetEventProperties", "events_get_event_properties"),
+        ("{" + EVENTS + "}CreatePullPointSubscription", "events_create_pull_point_subscription"),
+        ("{" + EVENTS + "}PullMessages", "events_pull_messages"),
+        ("{" + EVENTS + "}SetSynchronizationPoint", "events_set_synchronization_point"),
+        ("{" + WSNT + "}Renew", "subscription_renew"),
+        ("{" + WSNT + "}Unsubscribe", "subscription_unsubscribe"),
+    )
+}
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 _DURATION = re.compile(r"PT(?:(\d{1,4})H)?(?:(\d{1,4})M)?(?:(\d{1,4}(?:\.\d{1,3})?)S)?\Z")
@@ -362,6 +383,9 @@ class ONVIFServer:
         self._subscriptions: dict[str, _Subscription] = {}
         self._motion = False
         self._inflight = 0
+        self._operations_successful = dict.fromkeys(_DIAGNOSTIC_OPERATIONS.values(), 0)
+        self._pull_notifications_true = 0
+        self._pull_notifications_false = 0
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -418,6 +442,47 @@ class ONVIFServer:
         notification = _Notification(enabled, _utc(self._clock()))
         for subscription in self._subscriptions.values():
             self._enqueue(subscription, notification)
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Return safe, read-only counts on the same HA event loop.
+
+        Counters last for this server object's lifetime. A successful operation
+        means a response was prepared, NOT acknowledgement by Protect. There is
+        deliberately no peer attribution. Ignore expired subscriptions without
+        running _expire(), changing a queue, renewing a lease or activating video.
+        """
+        self._same_loop()
+        now = self._monotonic()
+        active = [sub for sub in self._subscriptions.values()
+                  if not sub.closed and sub.expires > now]
+        return {
+            "is_motion": self._motion,
+            "active_subscriptions": len(active),
+            "pulling_subscriptions": sum(sub.pulling for sub in active),
+            "queued_notifications": sum(len(sub.queue) for sub in active),
+            "inflight_requests": self._inflight,
+            "operations_successful": dict(self._operations_successful),
+            "pull_notifications_true": self._pull_notifications_true,
+            "pull_notifications_false": self._pull_notifications_false,
+        }
+
+    def _record_prepared_response(self, operation: ET.Element, response: ET.Element) -> None:
+        """Count only a successfully constructed response, never raw requests."""
+        name = _DIAGNOSTIC_OPERATIONS.get(operation.tag)
+        if name is not None:
+            self._operations_successful[name] = min(
+                MAX_DIAGNOSTIC_COUNT, self._operations_successful[name] + 1)
+        if response.tag != q(EVENTS, "PullMessagesResponse"):
+            return
+        for item in response.iter(q(SCHEMA, "SimpleItem")):
+            if item.get("Name") != "IsMotion":
+                continue
+            if item.get("Value") == "true":
+                self._pull_notifications_true = min(
+                    MAX_DIAGNOSTIC_COUNT, self._pull_notifications_true + 1)
+            elif item.get("Value") == "false":
+                self._pull_notifications_false = min(
+                    MAX_DIAGNOSTIC_COUNT, self._pull_notifications_false + 1)
 
     def _enqueue(self, subscription: _Subscription, notification: _Notification) -> None:
         if len(subscription.queue) >= MAX_MESSAGES:
@@ -498,7 +563,9 @@ class ONVIFServer:
             addressing = self._addressing(root, namespace, operation)
             subscription_id = request.match_info.get("subscription")
             result = await self._dispatch(operation, peer, subscription_id)
-            return self._response(namespace, result, addressing=addressing)
+            response = self._response(namespace, result, addressing=addressing)
+            self._record_prepared_response(operation, result)
+            return response
         except Rejected as error:
             response = self._fault(namespace, error.code, error.status)
             if error.status == 401:

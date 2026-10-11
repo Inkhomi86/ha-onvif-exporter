@@ -5,10 +5,12 @@ import asyncio
 import base64
 import hashlib
 import importlib.util
+import json
 import socket
 import sys
 import time
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -411,8 +413,102 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post(op(m.DEVICE, "GetServices")))[0], 503)
         self.server._inflight = 0
 
+    async def test_diagnostics_counts_only_successful_prepared_responses(self):
+        self.assertEqual(self.server.diagnostics_snapshot()["operations_successful"]["media_get_profiles"], 0)
+        self.assertEqual((await self.post(op(m.MEDIA, "GetProfiles"), auth=None))[0], 401)
+        self.assertEqual((await self.post(op(m.MEDIA, "GetProfiles", [(m.MEDIA, "URL", "private_marker")])))[0], 400)
+        self.assertEqual((await self.post(op("http://fixture.invalid/private_marker", "ArbitraryPrivateOperation")))[0], 400)
+        self.assertEqual((await self.post(op(m.MEDIA, "GetProfiles")))[0], 200)
+        snapshot = self.server.diagnostics_snapshot()
+        self.assertEqual(snapshot["operations_successful"]["media_get_profiles"], 1)
+        self.assertEqual(set(snapshot["operations_successful"]), set(m._DIAGNOSTIC_OPERATIONS.values()))
+        text = json.dumps(snapshot)
+        for forbidden in (PASSWORD, USER, "127.0.0.1", "private_marker", "ArbitraryPrivateOperation",
+                          "rtsp:", "/onvif/", "public-entry-camera", "standby"):
+            self.assertNotIn(forbidden, text)
+        # Returned counters are a detached copy, not an administrative handle.
+        snapshot["operations_successful"]["media_get_profiles"] = 99
+        self.assertEqual(self.server.diagnostics_snapshot()["operations_successful"]["media_get_profiles"], 1)
+
+    async def test_diagnostics_motion_notifications_counts_are_pull_response_counts(self):
+        path = await self.subscription()
+        before = self.server.diagnostics_snapshot()
+        self.assertEqual(before["active_subscriptions"], 1)
+        self.assertEqual(before["queued_notifications"], 1)
+        self.assertEqual(before["pull_notifications_false"], 0)
+        self.assertEqual(before["operations_successful"]["events_create_pull_point_subscription"], 1)
+        await self.pull(path)
+        self.server.set_motion(True)
+        self.server.set_motion(True)
+        self.server.set_motion(False)
+        self.assertEqual(self.server.diagnostics_snapshot()["pull_notifications_true"], 0)
+        await self.pull(path)
+        await self.pull(path)  # Empty response is successful, but no notification.
+        after = self.server.diagnostics_snapshot()
+        self.assertEqual(after["pull_notifications_true"], 1)
+        self.assertEqual(after["pull_notifications_false"], 2)
+        self.assertEqual(after["operations_successful"]["events_pull_messages"], 3)
+        self.assertFalse(after["is_motion"])
+        self.assertEqual(after["queued_notifications"], 0)
+
+    async def test_diagnostics_read_does_not_expire_renew_drain_or_signal(self):
+        path = await self.subscription()
+        key = path.rsplit("/", 1)[-1]
+        sub = self.server._subscriptions[key]
+        sub.expires = self.server._monotonic() - 1
+        sub.changed.clear()
+        before = (sub.expires, tuple(sub.queue), sub.closed, sub.pulling)
+        with mock.patch.object(self.server, "_expire", side_effect=AssertionError("mutation")):
+            snapshot = self.server.diagnostics_snapshot()
+        self.assertEqual(snapshot["active_subscriptions"], 0)
+        self.assertEqual(snapshot["queued_notifications"], 0)
+        self.assertEqual((sub.expires, tuple(sub.queue), sub.closed, sub.pulling), before)
+        self.assertFalse(sub.changed.is_set())
+        self.assertIn(key, self.server._subscriptions)
+
+    async def test_diagnostics_success_counter_saturates_and_failed_response_not_counted(self):
+        self.server._operations_successful["media_get_profiles"] = m.MAX_DIAGNOSTIC_COUNT
+        await self.post(op(m.MEDIA, "GetProfiles"))
+        self.assertEqual(self.server.diagnostics_snapshot()["operations_successful"]["media_get_profiles"], m.MAX_DIAGNOSTIC_COUNT)
+        self.server._operations_successful["media_get_profiles"] = 0
+        original = self.server._response
+        def fail_success(namespace, response, *args, **kwargs):
+            if response.tag == m.q(m.MEDIA, "GetProfilesResponse"):
+                raise ValueError("PRIVATE_ERROR_MUST_NOT_APPEAR")
+            return original(namespace, response, *args, **kwargs)
+        with mock.patch.object(self.server, "_response", side_effect=fail_success):
+            status, root = await self.post(op(m.MEDIA, "GetProfiles"))
+        self.assertEqual(status, 503)
+        self.assertNotIn("PRIVATE_ERROR_MUST_NOT_APPEAR", ET.tostring(root).decode())
+        self.assertEqual(self.server.diagnostics_snapshot()["operations_successful"]["media_get_profiles"], 0)
+
+    async def test_diagnostics_pulling_subscription_visible_without_interrupting_pull(self):
+        path = await self.subscription()
+        await self.pull(path)
+        waiter = asyncio.create_task(self.pull(path, timeout="PT0.15S"))
+        await asyncio.sleep(0.02)
+        snapshot = self.server.diagnostics_snapshot()
+        self.assertEqual(snapshot["pulling_subscriptions"], 1)
+        self.assertGreaterEqual(snapshot["inflight_requests"], 1)
+        self.assertFalse(waiter.done())
+        self.assertEqual((await waiter)[0], 200)
+        self.assertEqual(self.server.diagnostics_snapshot()["pulling_subscriptions"], 0)
+
 
 class ListenerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_diagnostics_rejects_wrong_thread_after_start(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = m.ONVIFServer(**config(port=port))
+        try:
+            await server.start()
+            self.assertFalse(server.diagnostics_snapshot()["is_motion"])
+            with self.assertRaises(RuntimeError):
+                await asyncio.to_thread(server.diagnostics_snapshot)
+        finally:
+            await server.stop()
+
     async def test_start_stop_exact_loopback_listener(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
