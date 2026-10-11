@@ -31,6 +31,10 @@ class ExportManager:
         self._tasks = set()
         self._start_task = self._watch_task = self._timer = None
         self._started = False
+        self._activation = 0
+        self._publisher_activation = 0
+        self._publisher_generation = 0
+        self._finishers = 0
         self._events = EventAdmission(settings[CONF_EVENT_FILTER], settings[CONF_EVENT_AT_FIELD])
         engine.set_callback(self._engine_changed)
 
@@ -94,13 +98,69 @@ class ExportManager:
         remaining = activated + self.window_seconds - now
         if remaining <= 0:
             return False
-        self.deadline = max(self.deadline, activated + self.window_seconds)
-        self.engine.extend_deadline(self.deadline)
+        deadline = max(self.deadline, activated + self.window_seconds)
+        try:
+            self.engine.extend_deadline(deadline)
+        except Exception:
+            self.status, self.error_code = "fault", self._media_failure("activation_failed")
+            self._notify()
+            return False
+        self._activation += 1  # Only an authorized activation permits another attempt.
+        if self.motion:
+            self._publisher_activation = self._activation
+        self.deadline = deadline
         self._arm_expiry()
-        if self._start_task is None or self._start_task.done():
-            self._start_task = self._task(self._open())
+        self._queue_open()
         self._notify()
         return True
+
+    def _queue_open(self):
+        if (self._started and not self._closing and self.enabled and not self._poisoned
+                and not self.motion and not self._finishers and self.deadline > time.monotonic()
+                and (self._start_task is None or self._start_task.done())):
+            self._start_task = self._task(self._open())
+            self._start_task.add_done_callback(self._opening_done)
+
+    def _opening_done(self, task):
+        if self._start_task is task:
+            self._start_task = None
+            self._queue_open()  # Failure clears its own window; only a renewal survives.
+
+    async def _cancel_open(self):
+        task = self._start_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            if not task.cancelling():
+                task.cancel()
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+
+    async def _complete_cleanup(self, coroutine):
+        """Repeated caller cancellation cannot interrupt our owned cleanup."""
+        task = asyncio.create_task(coroutine)
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _join_open_children(self, children):
+        for task in children:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if children:
+            await asyncio.gather(*children, return_exceptions=True)
+
+    async def _cleanup_open(self, children):
+        # In managed begin mode canceling waiters never closes WebRTC. Join the
+        # publisher task first, then require explicit confirmed reap before RTC.
+        await self._join_open_children(children)
+        return await self._close_owned()
 
     def _arm_expiry(self):
         if self._timer is not None:
@@ -121,43 +181,83 @@ class ExportManager:
             self.status = "starting"
             self._notify()
             publisher_attempted = False
+            attempt = self._activation
+            children = []
+            live = cancelled = failed = False
             try:
-                info = await self.consumer.open(self.settings[CONF_CAMERA_ENTITY])
+                info = await self.consumer.begin(self.settings[CONF_CAMERA_ENTITY])
                 if self.deadline <= time.monotonic() or self._closing or not self.enabled:
-                    await self._close_owned()
                     return
                 if info.source is None:
                     raise RuntimeError("managed_source_required")
                 self.engine.extend_deadline(self.deadline)
                 publisher_attempted = True
-                await self.engine.start_video(info.source)
+                self._publisher_activation = attempt
+                self._publisher_generation += 1
+                publisher = asyncio.create_task(self.engine.start_video(info.source))
+                frame = asyncio.create_task(self.consumer.wait_frame())
+                failure = asyncio.create_task(self.consumer.wait_failure())
+                children = [publisher, frame, failure]
+                pending = set(children)
+                while not (publisher.done() and frame.done()):
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    if failure in done or any(task.cancelled() or task.exception() is not None
+                                              for task in done if task is not failure):
+                        raise RuntimeError("opening_failed")
+                # Consume both results without exposing exceptions or TaskGroups.
+                if (publisher.cancelled() or frame.cancelled() or publisher.exception() is not None
+                        or frame.exception() is not None or failure.done()):
+                    raise RuntimeError("opening_failed")
+                await self._join_open_children([failure])
                 if self.deadline <= time.monotonic() or self._closing or not self.enabled:
-                    await self._close_owned()
                     return
+                if (self.consumer.session_id != info.session_id or not self.consumer.active
+                        or not self.consumer.frame_ready or not self.engine.video_running):
+                    raise RuntimeError("opening_failed")
                 self.motion, self.status = True, "live"
+                self._publisher_activation = self._activation
                 self.onvif.set_motion(True)
                 self._notify()
                 self._watch_task = self._task(self._watch_consumer(self.consumer.session_id))
+                live = True
             except asyncio.CancelledError:
-                await self._close_owned()
-                raise
+                cancelled = True
             except Exception:
-                self.error_code = "activation_failed"
-                self.deadline = 0
-                await self._close_owned()
-                if publisher_attempted and not self._poisoned:
-                    self.error_code = self._media_failure("activation_failed")
-                self.status = "fault"
+                failed = True
+                if self._activation == attempt:
+                    self.deadline = 0
+                    self.engine.extend_deadline(0)
+                    if self._timer:
+                        self._timer.cancel()
+                        self._timer = None
+            finally:
+                if not live:
+                    await self._complete_cleanup(self._cleanup_open(children))
+            if failed:
+                if self._activation == attempt or self._poisoned:
+                    if publisher_attempted and not self._poisoned:
+                        self.error_code = self._media_failure("activation_failed")
+                    elif not self._poisoned:
+                        self.error_code = "activation_failed"
+                    self.status = "fault"
                 self._notify()
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _watch_consumer(self, session_id):
-        await self.consumer.wait_closed()
+        await self.consumer.wait_failure()
         if self.consumer.session_id == session_id and self.motion and not self._closing:
-            await self._finish("consumer_failed", clear=True)
+            if self._watch_task is asyncio.current_task():
+                self._watch_task = None  # A cleanup child must not join its own parent.
+            await self._finish("consumer_failed", clear=True, expected_session=session_id,
+                               expected_activation=self._activation)
 
     def _engine_changed(self, code):
         if self._started and not self._closing and code in {"expired", "worker_failed", "server_failed"}:
-            self._task(self._finish(code, clear=code != "expired"))
+            self._task(self._finish(code, clear=code != "expired",
+                                   expected_session=self.consumer.session_id,
+                                   expected_activation=self._publisher_activation,
+                                   expected_publisher=self._publisher_generation))
 
     async def _close_owned(self):
         self.status = "stopping"
@@ -167,61 +267,100 @@ class ExportManager:
             await asyncio.gather(self._watch_task, return_exceptions=True)
         self._watch_task = None
         # Reap libav's RTSP reader before dropping the HA WebRTC reference.
-        confirmed = await self.engine.stop_video()
-        if not confirmed:
+        try:
+            confirmed = await self.engine.stop_video()
+        except Exception:
+            confirmed = False
+        if confirmed is not True:
             self._poisoned, self.error_code, self.status = True, "publisher_cleanup_unconfirmed", "fault"
             self.motion = False
             self.onvif.set_motion(False)
             self._notify()
             return False
-        had_session = self.consumer.session_id is not None
-        await self.consumer.close()
-        if had_session and not self.consumer.cleanup_ok:
-            self._poisoned, self.error_code = True, "consumer_cleanup_unconfirmed"
         self.motion = False
         self.onvif.set_motion(False)
+        self._notify()  # The confirmed publisher stop already exposes STANDBY.
+        had_session = self.consumer.session_id is not None
+        try:
+            await self.consumer.close()
+        except Exception:
+            self._poisoned, self.error_code = True, "consumer_cleanup_unconfirmed"
+        if had_session and not self.consumer.cleanup_ok:
+            self._poisoned, self.error_code = True, "consumer_cleanup_unconfirmed"
         self.status = "fault" if self._poisoned else ("standby" if self.enabled else "disabled")
         self._notify()
         return not self._poisoned
 
-    async def _finish(self, reason, *, clear, expiry_deadline=None):
-        if clear:
+    async def _finish(self, reason, *, clear, expiry_deadline=None,
+                      expected_session=None, expected_activation=None, expected_publisher=None):
+        if expected_publisher is not None and expected_publisher != self._publisher_generation:
+            return
+        if expected_session is not None and self.consumer.session_id != expected_session:
+            return  # A queued notification cannot close a later HA session.
+        if expiry_deadline is not None and self.deadline > time.monotonic():
+            return  # No physical worker kill happened for this stale HA timer.
+        renewed = expected_activation is not None and expected_activation != self._activation
+        attempt = self._activation
+        if clear and (not renewed or reason == "server_failed"):
             self.deadline = 0
             self.engine.extend_deadline(0)
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
-        async with self._lock:
-            if expiry_deadline is not None and self.deadline > time.monotonic():
-                # A queued timer from the old window cannot close its renewal.
-                return
-            if reason == "expired" and expiry_deadline is None and self.deadline > time.monotonic() and self.consumer.frame_ready:
-                # The watchdog has already killed the old publisher. A fresh
-                # activation needs a new publisher, not an ignored callback.
-                # Keep the healthy scoped HA reference while replacing it.
-                if not await self.engine.stop_video():
-                    await self._close_owned()
+        self._finishers += 1
+        try:
+            await self._cancel_open()  # Outside the lock owned by the opening task.
+            async with self._lock:
+                if expected_session is not None and self.consumer.session_id not in (expected_session, None):
                     return
-                try:
-                    self.engine.extend_deadline(self.deadline)
-                    await self.engine.start_video(self.consumer.source)
-                except Exception:
-                    self.deadline = 0
-                    await self._close_owned()
+                if expiry_deadline is not None and self.deadline > time.monotonic():
+                    return  # Opening was canceled before a genuine renewal arrived.
+                if (reason == "expired" and expiry_deadline is None and self.deadline > time.monotonic()
+                        and self.motion and self.consumer.active and self.consumer.frame_ready):
+                    # The watchdog has killed the old publisher. A fresh
+                    # activation needs a replacement, not an ignored callback.
+                    # Keep the healthy scoped HA reference while replacing it.
+                    self.motion = False
+                    self.onvif.set_motion(False)
+                    try:
+                        confirmed = await self.engine.stop_video()
+                    except Exception:
+                        confirmed = False
+                    if confirmed is not True:
+                        await self._complete_cleanup(self._close_owned())
+                        return
+                    try:
+                        self.engine.extend_deadline(self.deadline)
+                        self._publisher_generation += 1
+                        self._publisher_activation = attempt
+                        await self.engine.start_video(self.consumer.source)
+                        if (self.deadline <= time.monotonic() or not self.consumer.active
+                                or not self.engine.video_running or self._closing or not self.enabled):
+                            raise RuntimeError("opening_failed")
+                        self.motion, self.status = True, "live"
+                        self._publisher_activation = self._activation
+                        self.onvif.set_motion(True)
+                    except BaseException:
+                        if self._activation == attempt:
+                            self.deadline = 0
+                            self.engine.extend_deadline(0)
+                        await self._complete_cleanup(self._close_owned())
+                        if self._activation == attempt or self._poisoned:
+                            self.status = "fault"
+                            if not self._poisoned:
+                                self.error_code = self._media_failure("activation_failed")
+                    self._notify()
+                    return
+                await self._complete_cleanup(self._close_owned())
+                if (reason not in {"expired", "manual", "disabled", "shutdown"} and not renewed
+                        and (self._activation == attempt or reason == "server_failed" or self._poisoned)):
                     self.status = "fault"
                     if not self._poisoned:
-                        self.error_code = self._media_failure("activation_failed")
-                self._notify()
-                return
-            await self._close_owned()
-            if reason not in {"expired", "manual", "disabled", "shutdown"}:
-                self.status = "fault"
-                if not self._poisoned:
-                    self.error_code = self._media_failure(reason) if reason in {"worker_failed", "server_failed"} else reason
-                self._notify()
-        if not clear and self.deadline > time.monotonic() and not self._poisoned and not self._closing:
-            self.engine.extend_deadline(self.deadline)
-            self._start_task = self._task(self._open())
+                        self.error_code = self._media_failure(reason) if reason in {"worker_failed", "server_failed"} else reason
+                    self._notify()
+        finally:
+            self._finishers -= 1
+            self._queue_open()
 
     async def async_deactivate(self):
         await self._finish("manual", clear=True)
@@ -244,9 +383,7 @@ class ExportManager:
         if self._timer:
             self._timer.cancel()
             self._timer = None
-        if self._start_task and not self._start_task.done():
-            self._start_task.cancel()
-            await asyncio.gather(self._start_task, return_exceptions=True)
+        await self._cancel_open()
         await self._finish("shutdown", clear=True)
         for task in tuple(self._tasks):
             task.cancel()

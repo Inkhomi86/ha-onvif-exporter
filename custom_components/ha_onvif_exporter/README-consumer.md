@@ -1,8 +1,19 @@
 # Owned HA camera consumer
 
-`HACameraConsumer(hass, managed_go2rtc=True)` provides `await open(entity_id)`
-and `await close()`. Open returns `ConsumerInfo(entity_id, session_id, source)`
-only after receiving a real video frame. `source` is the alias returned by HA's
+`HACameraConsumer(hass, managed_go2rtc=True)` provides two readiness stages:
+
+- `await begin(entity_id)` returns `OpenedCamera(entity_id, session_id, source)`
+  after the SDP answer has been accepted by the local WebRTC peer. This is an
+  owned, receive-only HA session; it does **not** assert receipt of a frame.
+- `await wait_frame()` returns the same metadata only after an actual video
+  frame and its optional callback have succeeded. Both stages share one absolute
+  timeout, 15 seconds by default, starting when the session is reserved. A call
+  to `wait_frame` never starts another 15-second allowance.
+- `await close()` explicitly releases that exact owned session.
+
+The legacy `await open(entity_id)` waits for both stages and retains automatic
+cleanup on failure/cancellation. `ConsumerInfo` remains an alias of
+`OpenedCamera` for compatibility. `source` is the alias returned by HA's
 `get_camera_identifier`, fixed to `rtsp://127.0.0.1:18554/<alias>`, never the
 underlying camera URL. No HA bearer token or native-agent credential is needed.
 
@@ -22,8 +33,25 @@ go2rtc-oriented release; cameras requesting one are rejected before an offer.
 The external manager owns activation deduplication and the 30 s deadline from
 the latest valid activation. It must kill and await its RTSP output worker
 **before** calling consumer.close(). Keep the consumer open for the whole export
-window. Watch `wait_closed()` and `failure_code`; fall back to STANDBY on failure.
+window. In managed `begin` mode, watch `wait_failure()` and `failure_code`; fall
+back to STANDBY on failure. `wait_closed()` still means cleanup has completed,
+not merely that a failure was detected.
 Do not use `bticino_c300x.stop_doorbell_video` to stop an export window.
+
+Once `begin` has returned, failure, startup timeout, or cancellation of
+`wait_frame` signals failure without closing either the peer or HA's scoped
+camera reference. `active` and `frame_ready` become false, but `session_id` and
+`source` remain available. The caller must cancel/join its setup tasks, kill and
+reap its RTSP reader, and only then call `close`. An unclosed failed managed
+session rejects another `begin` with `consumer_busy`; no generation can bypass
+this fence. This also applies to failures after a frame was previously received.
+
+The exporter can start its local-alias publisher concurrently with `wait_frame`
+after `begin`, but may assert motion/live only after **both** the WebRTC frame
+and the publisher's first successfully muxed video packet are confirmed. SDP,
+track registration, a process spawn, or a previous generation's frame is not
+either readiness barrier. `begin` errors before handing off the session still
+clean up automatically because no reader may have been started yet.
 
 `managed_go2rtc=True` is an explicit deployment prerequisite. A custom camera
 may implement native WebRTC without using go2rtc; this generic class cannot infer

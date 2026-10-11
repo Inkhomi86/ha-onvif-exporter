@@ -1,7 +1,7 @@
 {
   "domain": "ha_onvif_exporter",
   "name": "HA ONVIF Exporter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "config_flow": true,
   "documentation": "https://github.com/Inkhomi86/ha-onvif-exporter",
   "issue_tracker": "https://github.com/Inkhomi86/ha-onvif-exporter/issues",

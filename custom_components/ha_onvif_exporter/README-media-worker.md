@@ -22,13 +22,16 @@ square pixels -> fps30 -> yuv420p -> libx264 Main1920x1080/30, GOP10, no B-frame
 zerolatency, one thread -> authenticated MediaMTX TCP RTSP. Initial exporter is
 video-only; HA audio, microphone, and talkback remain managed by the camera.
 
-The parent holds a real HA WebRTC reference and receives a frame BEFORE this
-worker opens the alias. It owns the last-activation+30s deadline, external
+The parent holds an owned HA WebRTC reference after the provider answer is
+accepted, then starts this reader while waiting for the first WebRTC frame.
+Live/motion requires BOTH an actual received WebRTC frame and successfully
+muxed worker output; a negotiated answer alone never claims live video.
+The parent owns the last-activation+30s deadline, external
 watchdog, termination/reap, and fallback STANDBY. Kill/reap this reader BEFORE
 closing that WebRTC reference. SIGTERM is a cooperative stop flag, not a hard
 guarantee against blocked libav I/O; use a bounded grace followed by exact-child
-kill/reap. Source connection has a1s timeout and source reading a4s timeout;
-output operations remain bounded to1s. There are no
+kill/reap. Source connection has a 1 s timeout and source reading a 4 s timeout;
+output operations remain bounded to 1 s. There are no
 native API calls, unlocks, callback registration, retries, or renewals here.
 
 Existing-source PTS are preserved relative to the first valid timestamp. Up to

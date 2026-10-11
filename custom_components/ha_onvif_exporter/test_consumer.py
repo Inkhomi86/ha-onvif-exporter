@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 _NAME = "ha_onvif_exporter_consumer_under_test"
 spec = importlib.util.spec_from_file_location(_NAME, Path(__file__).with_name("consumer.py"))
@@ -42,6 +43,7 @@ class FakePeer:
         self.video = FakeTrack("video")
         self.audio = FakeTrack("audio")
         self.auto_frame = True
+        self.remote_gate = None
 
     def on(self, name):
         def register(fn):
@@ -59,6 +61,8 @@ class FakePeer:
         self.localDescription = offer
 
     async def setRemoteDescription(self, answer):
+        if self.remote_gate is not None:
+            await self.remote_gate.wait()
         self.remote.append(answer)
         self.handlers["track"](self.video)
         if ("audio", "recvonly") in self.transceivers:
@@ -92,12 +96,15 @@ class FakeCamera:
         self.hang = False
         self.close_failure = False
         self.offer_entered = asyncio.Event()
+        self.answer_gate = None
 
     async def async_handle_async_webrtc_offer(self, sdp, session_id, callback):
         self.calls.append((sdp, session_id))
         self.sessions.add(session_id)
         self.callback = callback
         self.offer_entered.set()
+        if self.answer_gate is not None:
+            await self.answer_gate.wait()
         for message in self.messages:
             callback(message)
         if self.hang:
@@ -170,6 +177,176 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         info = await task
         self.assertTrue(self.consumer.frame_ready)
         self.assertEqual(info.source, self.backend.alias)
+
+    async def test_begin_returns_accepted_answer_before_frame(self):
+        self.backend.auto_frame = False
+        info = await self.consumer.begin("camera.test")
+        self.assertIsInstance(info, module.OpenedCamera)
+        self.assertIs(module.ConsumerInfo, module.OpenedCamera)
+        self.assertEqual(len(self.backend.peers[0].remote), 1)
+        self.assertFalse(self.consumer.frame_ready)
+        self.assertTrue(self.consumer.active)
+        self.assertEqual(info.source, self.backend.alias)
+        pending = asyncio.create_task(self.consumer.wait_frame())
+        await asyncio.sleep(0)
+        self.assertFalse(pending.done())
+        self.backend.peers[0].video.queue.put_nowait("first-real-frame")
+        self.assertEqual(await pending, info)
+        self.assertTrue(self.consumer.frame_ready)
+
+    async def test_begin_never_returns_before_remote_answer_accepted(self):
+        self.backend.camera.messages = []
+        task = asyncio.create_task(self.consumer.begin("camera.test"))
+        await self.backend.camera.offer_entered.wait()
+        gate = self.backend.peers[0].remote_gate = asyncio.Event()
+        self.backend.camera.callback({"type": "answer", "answer": "v=0"})
+        await asyncio.sleep(.01)
+        self.assertFalse(task.done())
+        self.assertFalse(self.consumer.frame_ready)
+        gate.set()
+        await task
+
+    async def test_begin_preanswer_error_auto_cleans_without_handoff(self):
+        self.backend.camera.messages = [{"type": "error", "message": "private"}]
+        with self.assertRaises(ConsumerError) as caught:
+            await self.consumer.begin("camera.test")
+        self.assertEqual(caught.exception.code, "provider_error")
+        self.assertTrue(self.consumer.cleanup_ok)
+        self.assertEqual(len(self.backend.camera.closed_ids), 1)
+
+    async def test_cancel_begin_before_answer_auto_cleans(self):
+        self.backend.camera.messages = []
+        task = asyncio.create_task(self.consumer.begin("camera.test"))
+        await self.backend.camera.offer_entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.assertFalse(self.consumer.active)
+        self.assertEqual(len(self.backend.camera.closed_ids), 1)
+
+    async def test_close_while_begin_pending_preserves_other_session(self):
+        self.backend.camera.messages = []
+        task = asyncio.create_task(self.consumer.begin("camera.test"))
+        await self.backend.camera.offer_entered.wait()
+        await self.consumer.close()
+        with self.assertRaises(ConsumerError) as caught: await task
+        self.assertEqual(caught.exception.code, "consumer_closed")
+        self.assertEqual(self.backend.camera.sessions, {"other-ui-session"})
+
+    async def test_wait_frame_without_begin_rejected(self):
+        with self.assertRaises(ConsumerError) as caught: await self.consumer.wait_frame()
+        self.assertEqual(caught.exception.code, "consumer_not_started")
+
+    async def test_cancel_wait_frame_retains_reference_until_explicit_close(self):
+        self.backend.auto_frame = False
+        info = await self.consumer.begin("camera.test")
+        pending = asyncio.create_task(self.consumer.wait_frame())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError): await pending
+        self.assertEqual(await self.consumer.wait_failure(), "open_cancelled")
+        self.assertEqual(self.backend.camera.closed_ids, [])
+        self.assertIn(info.session_id, self.backend.camera.sessions)
+        self.assertEqual(self.backend.peers[0].close_count, 0)
+        self.assertFalse(self.consumer.frame_ready)
+        self.assertFalse(self.consumer.active)
+        await self.consumer.close()
+        self.assertEqual(self.backend.camera.closed_ids, [info.session_id])
+        self.assertTrue(self.consumer.cleanup_ok)
+
+    async def test_wait_frame_error_retains_reference_and_never_ready(self):
+        self.backend.auto_frame = False
+        info = await self.consumer.begin("camera.test")
+        self.backend.camera.callback({"type": "error", "message": "private-url"})
+        self.assertEqual(await self.consumer.wait_failure(), "provider_error")
+        with self.assertRaises(ConsumerError) as caught: await self.consumer.wait_frame()
+        self.assertEqual(caught.exception.code, "provider_error")
+        self.assertFalse(self.consumer.frame_ready)
+        self.assertEqual(self.backend.camera.closed_ids, [])
+        self.assertEqual(self.backend.peers[0].close_count, 0)
+        await self.consumer.close()
+        self.assertEqual(self.backend.camera.closed_ids, [info.session_id])
+
+    async def test_begin_startup_timeout_without_waiter_retains_reference(self):
+        self.backend.auto_frame = False
+        self.consumer = Consumer(None, backend=self.backend, open_timeout=.035, frame_timeout=1)
+        info = await self.consumer.begin("camera.test")
+        self.assertEqual(await asyncio.wait_for(self.consumer.wait_failure(), .2), "open_timeout")
+        self.assertEqual(self.backend.camera.closed_ids, [])
+        self.assertEqual(self.backend.peers[0].close_count, 0)
+        self.assertFalse(self.consumer.frame_ready)
+        closed = asyncio.create_task(self.consumer.wait_closed())
+        await asyncio.sleep(0)
+        self.assertFalse(closed.done())
+        await self.consumer.close()
+        await closed
+        self.assertEqual(self.backend.camera.closed_ids, [info.session_id])
+
+    async def test_begin_and_frame_share_single_total_timeout(self):
+        self.backend.auto_frame = False
+        self.backend.camera.answer_gate = asyncio.Event()
+        self.consumer = Consumer(None, backend=self.backend, open_timeout=.3, frame_timeout=1)
+        start = asyncio.get_running_loop().time()
+        with mock.patch.object(module.asyncio, "timeout_at", wraps=asyncio.timeout_at) as timeouts:
+            begun = asyncio.create_task(self.consumer.begin("camera.test"))
+            await self.backend.camera.offer_entered.wait()
+            await asyncio.sleep(.05)
+            self.backend.camera.answer_gate.set()
+            await begun
+            deadline = self.consumer._session.open_deadline
+            with self.assertRaises(ConsumerError) as caught: await self.consumer.wait_frame()
+        self.assertEqual([call.args[0] for call in timeouts.call_args_list], [deadline, deadline],
+                         "Both readiness gates must use one absolute deadline")
+        self.assertEqual(caught.exception.code, "open_timeout")
+        self.assertLess(asyncio.get_running_loop().time() - start, .6)
+        self.assertEqual(self.consumer._session.open_deadline, deadline)
+        self.assertEqual(self.backend.camera.closed_ids, [])
+
+    async def test_close_wait_frame_rejects_ready_and_closes_once(self):
+        self.backend.auto_frame = False
+        info = await self.consumer.begin("camera.test")
+        waiter = asyncio.create_task(self.consumer.wait_frame())
+        await asyncio.sleep(0)
+        await asyncio.gather(*(self.consumer.close() for _ in range(4)))
+        with self.assertRaises(ConsumerError) as caught: await waiter
+        self.assertEqual(caught.exception.code, "consumer_closed")
+        self.assertEqual(self.backend.camera.closed_ids, [info.session_id])
+        self.assertEqual(self.backend.peers[0].close_count, 1)
+
+    async def test_managed_failure_after_frame_waits_for_reap_permission(self):
+        info = await self.consumer.begin("camera.test")
+        await self.consumer.wait_frame()
+        self.backend.peers[0].video.queue.put_nowait(RuntimeError("private"))
+        self.assertEqual(await asyncio.wait_for(self.consumer.wait_failure(), .2), "media_failed")
+        self.assertEqual(self.backend.camera.closed_ids, [])
+        self.assertEqual(self.backend.peers[0].close_count, 0)
+        self.assertFalse(self.consumer.frame_ready)
+        with self.assertRaises(ConsumerError): await self.consumer.wait_frame()
+        await self.consumer.close()
+        self.assertEqual(self.backend.camera.closed_ids, [info.session_id])
+
+    async def test_managed_busy_until_explicit_release_even_after_failure(self):
+        self.backend.auto_frame = False
+        await self.consumer.begin("camera.test")
+        self.backend.camera.callback({"type": "closed"})
+        await self.consumer.wait_failure()
+        with self.assertRaises(ConsumerError) as caught: await self.consumer.begin("camera.test")
+        self.assertEqual(caught.exception.code, "consumer_busy")
+        self.assertEqual(len(self.backend.peers), 1)
+        await self.consumer.close()
+        self.backend.auto_frame = True
+        await self.consumer.begin("camera.test")
+        await self.consumer.wait_frame()
+        self.assertEqual(len(self.backend.peers), 2)
+
+    async def test_late_wait_failure_from_previous_generation_does_not_follow_new(self):
+        first = await self.consumer.begin("camera.test")
+        watcher = asyncio.create_task(self.consumer.wait_failure())
+        await asyncio.sleep(0)
+        await self.consumer.close()
+        second = await self.consumer.begin("camera.test")
+        self.assertIsNone(await watcher)
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertTrue(self.consumer.active)
 
     async def test_receive_only_audio_video_no_microphone(self):
         await self.opened()

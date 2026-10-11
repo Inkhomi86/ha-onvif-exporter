@@ -62,7 +62,8 @@ default catalog.
 
 1. Back up Home Assistant. In HACS, add the custom repository
    `https://github.com/Inkhomi86/ha-onvif-exporter`, category **Integration**.
-2. Download the desired release through HACS. Follow any restart/repair notice
+2. Download through HACS (select `main` if no tagged release is available).
+   Follow any restart/repair notice
    shown by HACS; do not assume every installation or update is hot-reloadable.
 3. Open **Settings → Devices & services → Add integration → HA ONVIF Exporter**.
 4. Select the compatible existing camera, an exact local IPv4 bind address,

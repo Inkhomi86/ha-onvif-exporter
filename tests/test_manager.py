@@ -58,26 +58,50 @@ class Consumer:
         self.failure_code = None
         self.open_calls = self.close_calls = 0
         self.open_gate = asyncio.Event(); self.open_gate.set()
+        self.frame_gate = asyncio.Event(); self.frame_gate.set()
+        self.close_gate = asyncio.Event(); self.close_gate.set()
+        self.failed = asyncio.Event()
+        self.fail_frame = False
         self.closed = asyncio.Event()
         self.source = "rtsp://127.0.0.1:18554/camera_fixture"
-    async def open(self, entity_id):
+    async def begin(self, entity_id):
         self.open_calls += 1
         self.trace.append("consumer_open")
         self.session_id = str(self.open_calls)
         self.closed = asyncio.Event()
+        self.failed = asyncio.Event()
         await self.open_gate.wait()
         self.active = True
-        self.frame_ready = True
-        return SimpleNamespace(source=self.source)
+        self.frame_ready = False
+        return SimpleNamespace(source=self.source, session_id=self.session_id)
+    async def wait_frame(self):
+        self.trace.append("frame_wait")
+        try:
+            await self.frame_gate.wait()
+            if self.fail_frame: raise RuntimeError("PRIVATE_FIXTURE_FRAME_FAILURE")
+            self.frame_ready = True
+            self.trace.append("frame_ready")
+        finally:
+            self.trace.append("frame_wait_done")
+    async def open(self, entity_id):
+        info = await self.begin(entity_id)
+        await self.wait_frame()
+        return info
     async def close(self):
         self.close_calls += 1
         self.trace.append("consumer_close")
+        await self.close_gate.wait()
         self.active = False
         self.frame_ready = False
         self.closed.set()
+        self.failed.set()
     async def wait_closed(self):
         reference = self.closed
         await reference.wait()
+    async def wait_failure(self):
+        reference = self.failed
+        await reference.wait()
+        return "media_failed"
 
 
 class Engine:
@@ -90,16 +114,27 @@ class Engine:
         self.cleanup_confirmed = True
         self.start_gate = asyncio.Event(); self.start_gate.set()
         self.fail_start_video = False
+        self.fail_once = False
         self.video_stops = 0
+        self.cancel_gate = asyncio.Event(); self.cancel_gate.set()
+    @property
+    def video_running(self): return self.video
     def set_callback(self, callback): self.callback = callback
     async def start(self): self.trace.append("engine_start"); self.started = True
     async def stop(self): self.trace.append("engine_stop"); self.started = False; return self.cleanup_confirmed
     def extend_deadline(self, deadline): self.deadlines.append(deadline)
     async def start_video(self, source):
         self.trace.append("video_start")
-        await self.start_gate.wait()
-        if self.fail_start_video: raise RuntimeError("PUBLIC_FAKE_FAILURE")
-        self.video = True
+        try:
+            await self.start_gate.wait()
+            if self.fail_start_video:
+                if self.fail_once: self.fail_start_video = False
+                raise RuntimeError("PUBLIC_FAKE_FAILURE")
+            self.video = True
+        except asyncio.CancelledError:
+            await self.cancel_gate.wait()
+            self.trace.append("video_cancel_joined")
+            raise
     async def stop_video(self):
         self.trace.append("video_stop")
         self.video_stops += 1
@@ -136,12 +171,15 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.manager._listeners.clear()
-        self.consumer.open_gate.set(); self.engine.start_gate.set()
+        for name in ("open_gate", "frame_gate", "close_gate"):
+            gate = getattr(self.consumer, name, None)
+            if gate is not None: gate.set()
+        self.engine.start_gate.set(); self.engine.cancel_gate.set()
         self.engine.cleanup_confirmed = True
         await self.manager.stop()
         self.monotonic.stop()
 
-    async def settle(self, turns=10):
+    async def settle(self, turns=30):
         for _ in range(turns): await asyncio.sleep(0)
 
     async def live(self):
@@ -316,7 +354,8 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_consumer_failure_falls_back_to_standby_no_reactivation(self):
         await self.live()
-        self.consumer.closed.set()
+        self.consumer.active = self.consumer.frame_ready = False
+        self.consumer.failed.set()
         await self.settle(20)
         self.assertFalse(self.engine.video)
         self.assertFalse(self.manager.motion)
@@ -351,6 +390,239 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.stop()
         self.assertEqual(self.hass.bus.unsubscribed, 1)
         self.assertFalse(await self.manager.async_activate())
+
+    async def test_reader_starts_before_first_ha_frame_but_motion_waits_for_both(self):
+        self.consumer.frame_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.assertIn("video_start", self.trace)
+        self.assertTrue(self.engine.video)
+        self.assertFalse(self.manager.motion)
+        self.assertNotIn("motion_True", self.trace)
+        self.consumer.frame_gate.set()
+        await self.settle()
+        self.assertTrue(self.manager.motion)
+        self.assertLess(self.trace.index("frame_ready"), self.trace.index("motion_True"))
+
+    async def test_first_ha_frame_without_mux_is_not_motion(self):
+        self.engine.start_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.assertTrue(self.consumer.frame_ready)
+        self.assertFalse(self.engine.video)
+        self.assertFalse(self.manager.motion)
+        self.engine.start_gate.set()
+        await self.settle()
+        self.assertTrue(self.manager.motion)
+
+    async def test_worker_error_cancels_frame_waiter_without_retry(self):
+        self.consumer.frame_gate.clear()
+        self.engine.fail_start_video = True
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle(80)
+        self.assertEqual(self.consumer.open_calls, 1)
+        self.assertEqual(self.manager.deadline, 0)
+        self.assertNotIn("motion_True", self.trace)
+        self.assertLess(self.trace.index("frame_wait_done"), self.trace.index("consumer_close"))
+        self.assertLess(self.trace.index("video_stop"), self.trace.index("consumer_close"))
+
+    async def test_frame_error_joins_pending_publisher_before_rtc_close(self):
+        self.consumer.fail_frame = True
+        self.engine.start_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.assertLess(self.trace.index("video_cancel_joined"), self.trace.index("video_stop"))
+        self.assertLess(self.trace.index("video_stop"), self.trace.index("consumer_close"))
+        self.assertFalse(self.manager.motion)
+
+    async def test_peer_failure_after_frame_while_publisher_pending_closes_promptly(self):
+        self.engine.start_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.consumer.active = self.consumer.frame_ready = False
+        self.consumer.failed.set()
+        await self.settle()
+        self.assertIn("video_cancel_joined", self.trace)
+        self.assertFalse(self.consumer.active)
+        self.assertEqual(self.manager.deadline, 0)
+        self.assertNotIn("motion_True", self.trace)
+
+    async def test_manual_during_begin_cancels_open_outside_lock(self):
+        self.consumer.open_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        await self.manager.async_deactivate()
+        self.assertNotIn("video_start", self.trace)
+        self.assertFalse(self.manager.motion)
+        self.assertEqual(self.manager.deadline, 0)
+
+    async def test_expiry_during_begin_cancels_open_without_retry(self):
+        self.consumer.open_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.clock.now = 131
+        self.manager._expired()
+        await self.settle()
+        self.assertNotIn("video_start", self.trace)
+        self.assertFalse(self.manager.motion)
+        self.assertEqual(self.consumer.open_calls, 1)
+
+    async def test_cancellation_joins_blocked_publisher_before_consumer_close(self):
+        self.engine.start_gate.clear()
+        self.engine.cancel_gate.clear()
+        self.consumer.frame_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        first = asyncio.create_task(self.manager.async_deactivate())
+        await self.settle()
+        second = asyncio.create_task(self.manager.async_deactivate())
+        await self.settle()
+        self.assertEqual(self.consumer.close_calls, 0)
+        self.assertFalse(first.done())
+        self.engine.cancel_gate.set()
+        await asyncio.gather(first, second)
+        self.assertLess(self.trace.index("video_cancel_joined"), self.trace.index("consumer_close"))
+
+    async def test_renewal_during_expiry_cleanup_restarts_only_new_activation(self):
+        self.engine.start_gate.clear()
+        self.engine.cancel_gate.clear()
+        self.consumer.frame_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.clock.now = 130
+        self.manager._expired()
+        await self.settle()
+        self.clock.now = 131
+        await self.manager.async_activate()
+        self.engine.start_gate.set(); self.engine.cancel_gate.set(); self.consumer.frame_gate.set()
+        await self.settle(80)
+        self.assertEqual(self.manager.deadline, 161)
+        self.assertEqual(self.consumer.open_calls, 2)
+        self.assertEqual(self.manager.status, "live")
+
+    async def test_old_attempt_failure_preserves_new_authorized_activation(self):
+        self.engine.start_gate.clear()
+        self.engine.fail_start_video = self.engine.fail_once = True
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.clock.now = 110
+        await self.manager.async_activate()
+        self.engine.start_gate.set()
+        await self.settle(80)
+        self.assertEqual(self.manager.deadline, 140)
+        self.assertEqual(self.consumer.open_calls, 2)
+        self.assertTrue(self.manager.motion)
+
+    async def test_stale_session_failure_cannot_clear_later_session(self):
+        await self.live()
+        old_session, old_activation = self.consumer.session_id, self.manager._activation
+        await self.manager.async_deactivate()
+        await self.manager.async_activate()
+        await self.settle()
+        stops = self.engine.video_stops
+        await self.manager._finish("worker_failed", clear=True, expected_session=old_session,
+                                   expected_activation=old_activation)
+        self.assertEqual(self.engine.video_stops, stops)
+        self.assertTrue(self.manager.motion)
+        self.assertEqual(self.manager.deadline, 130)
+
+    async def test_stale_publisher_failure_cannot_clear_replacement_on_same_session(self):
+        await self.live()
+        old_generation = self.manager._publisher_generation
+        self.clock.now = 131
+        self.engine.video = False
+        self.engine.callback("expired")
+        await self.manager.async_activate()
+        await self.settle()
+        stops = self.engine.video_stops
+        await self.manager._finish("worker_failed", clear=True, expected_session=self.consumer.session_id,
+                                   expected_activation=self.manager._activation, expected_publisher=old_generation)
+        self.assertEqual(self.engine.video_stops, stops)
+        self.assertTrue(self.manager.motion)
+        self.assertEqual(self.manager.deadline, 161)
+
+    async def test_motion_off_before_blocking_consumer_close(self):
+        await self.live()
+        self.consumer.close_gate.clear()
+        task = asyncio.create_task(self.manager.async_deactivate())
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertFalse(self.engine.video)
+        self.assertFalse(self.manager.motion)
+        self.assertFalse(self.onvif.motion)
+        self.consumer.close_gate.set()
+        await task
+        self.assertLess(self.trace.index("motion_False"), self.trace.index("consumer_close"))
+
+    async def test_failure_cleanup_does_not_reassign_error_to_new_activation(self):
+        await self.live()
+        self.consumer.close_gate.clear()
+        finish = asyncio.create_task(self.manager._finish("worker_failed", clear=True))
+        await self.settle()
+        self.clock.now = 110
+        await self.manager.async_activate()
+        self.consumer.close_gate.set()
+        await finish
+        await self.settle()
+        self.assertTrue(self.manager.motion)
+        self.assertIsNone(self.manager.error_code)
+        self.assertEqual(self.manager.deadline, 140)
+
+    async def test_open_failure_cleanup_does_not_reassign_error_to_new_activation(self):
+        self.engine.fail_start_video = self.engine.fail_once = True
+        self.consumer.close_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle()
+        self.clock.now = 110
+        await self.manager.async_activate()
+        self.consumer.close_gate.set()
+        await self.settle(80)
+        self.assertTrue(self.manager.motion)
+        self.assertIsNone(self.manager.error_code)
+        self.assertEqual(self.manager.deadline, 140)
+
+    async def test_real_consumer_failure_fence_with_pending_owned_reader(self):
+        spec = importlib.util.spec_from_file_location("manager_consumer_fixture", BASE / "test_consumer.py")
+        fixtures = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = fixtures
+        spec.loader.exec_module(fixtures)
+        backend = fixtures.FakeBackend()
+        backend.auto_frame = False
+        self.consumer = fixtures.Consumer(self.hass, backend=backend, managed_go2rtc=True,
+                                         receive_audio=False, open_timeout=1.0, frame_timeout=0.5)
+        self.manager.consumer = self.consumer
+        self.engine.start_gate.clear()
+        self.engine.cancel_gate.clear()
+        await self.manager.start()
+        await self.manager.async_activate()
+        await self.settle(60)
+        self.assertIn("video_start", self.trace)
+        peer = backend.peers[0]
+        session_id = self.consumer.session_id
+        peer.video.queue.put_nowait(RuntimeError("PRIVATE_MEDIA_FAILURE"))
+        await self.settle(60)
+        self.assertFalse(self.consumer.active)
+        self.assertEqual(backend.camera.closed_ids, [])
+        self.assertEqual(peer.close_count, 0)
+        self.assertIn(session_id, backend.camera.sessions)
+        self.engine.cancel_gate.set()
+        await self.settle(80)
+        self.assertEqual(backend.camera.closed_ids, [session_id])
+        self.assertEqual(peer.close_count, 1)
+        self.assertEqual(backend.camera.sessions, {"other-ui-session"})
+        self.assertFalse(self.manager.motion)
+        self.assertTrue(self.consumer.cleanup_ok)
 
 
 class PolicyTests(unittest.TestCase):

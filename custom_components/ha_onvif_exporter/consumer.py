@@ -33,12 +33,16 @@ class ConsumerError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class ConsumerInfo:
+class OpenedCamera:
     """Public metadata. Source is the HA loopback alias, never the camera URL."""
 
     entity_id: str
     session_id: str
     source: str | None
+
+
+# Preserve the original metadata name for existing callers.
+ConsumerInfo = OpenedCamera
 
 
 class ConsumerBackend(Protocol):
@@ -116,9 +120,11 @@ class HomeAssistantBackend:
 
 @dataclass(slots=True)
 class _Session:
-    info: ConsumerInfo
+    info: OpenedCamera
     camera: Any
-    ready: asyncio.Future[ConsumerInfo]
+    negotiated: asyncio.Future[OpenedCamera]
+    ready: asyncio.Future[OpenedCamera]
+    open_deadline: float
     stopped: asyncio.Event = field(default_factory=asyncio.Event)
     closed: asyncio.Event = field(default_factory=asyncio.Event)
     signals: asyncio.Queue[Mapping[str, Any]] = field(
@@ -137,6 +143,9 @@ class _Session:
     video_tracks: int = 0
     audio_tracks: int = 0
     cleanup_ok: bool = True
+    managed_lifetime: bool = False
+    release_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    startup_timer: asyncio.TimerHandle | None = None
 
 
 class HACameraConsumer:
@@ -195,7 +204,8 @@ class HACameraConsumer:
 
     @property
     def active(self) -> bool:
-        return bool(self._session and not self._session.closing and not self._session.closed.is_set())
+        return bool(self._session and not self._session.closing and not self._session.closed.is_set()
+                    and not self._session.stopped.is_set())
 
     @property
     def failure_code(self) -> str | None:
@@ -206,8 +216,23 @@ class HACameraConsumer:
         """Local peer/tasks and scoped callback succeeded, not native idle ACK."""
         return bool(self._session and self._session.closed.is_set() and self._session.cleanup_ok)
 
-    async def open(self, entity_id: str) -> ConsumerInfo:
-        """Reserve our reference, negotiate recvonly, and wait for actual video."""
+    async def begin(self, entity_id: str) -> OpenedCamera:
+        """Negotiate an owned session; no claim of a received frame is made.
+
+        Once returned, the caller MUST explicitly close after reaping its reader.
+        Failure/cancellation of wait_frame never releases this HA reference.
+        """
+        session, info = await self._begin(entity_id)
+        # No await between handing off this lifetime and returning its metadata.
+        session.managed_lifetime = True
+        return info
+
+    async def open(self, entity_id: str) -> OpenedCamera:
+        """Legacy frame-ready open with automatic cleanup on failure/cancel."""
+        session, _ = await self._begin(entity_id)
+        return await self._wait_gate(session, session.ready)
+
+    async def _begin(self, entity_id: str) -> tuple[_Session, OpenedCamera]:
         if not isinstance(entity_id, str) or not _ENTITY_ID.fullmatch(entity_id):
             raise ConsumerError("invalid_entity_id")
         async with self._lock:
@@ -228,24 +253,60 @@ class HACameraConsumer:
                 raise
             except Exception:
                 raise ConsumerError("camera_unavailable") from None
-            info = ConsumerInfo(entity_id, secrets.token_hex(16), source)
+            loop = asyncio.get_running_loop()
+            info = OpenedCamera(entity_id, secrets.token_hex(16), source)
             session = self._session = _Session(
-                info, camera, asyncio.get_running_loop().create_future()
+                info, camera, loop.create_future(), loop.create_future(),
+                loop.time() + self._open_timeout,
             )
+            # Failure may be reported through wait_failure without either gate
+            # being awaited; retrieving it here does not change await semantics.
+            for gate in (session.negotiated, session.ready):
+                gate.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+            session.startup_timer = loop.call_at(session.open_deadline, self._startup_expired, session)
             session.runner = asyncio.create_task(self._run(session))
+        info = await self._wait_gate(session, session.negotiated)
+        return session, info
+
+    async def wait_frame(self) -> OpenedCamera:
+        """Wait for this generation's actual video under its original deadline."""
+        session = self._session
+        if session is None:
+            raise ConsumerError("consumer_not_started")
+        return await self._wait_gate(session, session.ready)
+
+    async def _wait_gate(self, session: _Session, gate: asyncio.Future[OpenedCamera]) -> OpenedCamera:
         try:
-            async with asyncio.timeout(self._open_timeout):
-                return await asyncio.shield(session.ready)
+            async with asyncio.timeout_at(session.open_deadline):
+                info = await asyncio.shield(gate)
+            if session.closing or session.closed.is_set() or session.stopped.is_set():
+                raise ConsumerError(session.failure or "consumer_closed")
+            return info
         except TimeoutError:
             self._fail(session, "open_timeout")
-            await self._close_session(session)
+            if not session.managed_lifetime:
+                await self._close_session(session)
             raise ConsumerError("open_timeout") from None
         except asyncio.CancelledError:
-            await self._close_session(session)
+            if session.managed_lifetime:
+                self._fail(session, "open_cancelled")
+            else:
+                await self._close_session(session)
             raise
         except ConsumerError:
-            await self._close_session(session)
+            if not session.managed_lifetime:
+                await self._close_session(session)
             raise
+
+    def _startup_expired(self, session: _Session) -> None:
+        session.startup_timer = None
+        self._fail(session, "open_timeout")
+
+    @staticmethod
+    def _cancel_startup_timer(session: _Session) -> None:
+        if session.startup_timer is not None:
+            session.startup_timer.cancel()
+            session.startup_timer = None
 
     async def close(self) -> None:
         """Close only our own peer and public camera subscription.
@@ -264,6 +325,14 @@ class HACameraConsumer:
         if session:
             await session.closed.wait()
 
+    async def wait_failure(self) -> str | None:
+        """Signal failure/stop without releasing a managed session reference."""
+        session = self._session
+        if session:
+            await session.stopped.wait()
+            return session.failure
+        return None
+
     @staticmethod
     def _valid_source(source: str) -> bool:
         prefix = "rtsp://127.0.0.1:18554/"
@@ -274,16 +343,28 @@ class HACameraConsumer:
             return
         if session.failure is None:
             session.failure = code
+        if not session.negotiated.done():
+            session.negotiated.set_exception(ConsumerError(session.failure))
         if not session.ready.done():
             session.ready.set_exception(ConsumerError(session.failure))
         session.stopped.set()
+        # A provider may still be awaiting unrelated work after its answer.
+        # Enter the release fence promptly, but never cancel cleanup twice.
+        if session.managed_lifetime and session.phase == "running" and not session.cancel_requested:
+            if session.runner and session.runner is not asyncio.current_task() and not session.runner.done():
+                session.cancel_requested = True
+                session.runner.cancel()
 
     async def _close_session(self, session: _Session) -> None:
         # Never follow self._session after an await: a previous close must not
         # affect a subsequent generation. A canceled caller cannot cancel cleanup.
         if not session.closed.is_set():
+            session.release_requested.set()
             session.closing = True
             session.stopped.set()
+            self._cancel_startup_timer(session)
+            if not session.negotiated.done():
+                session.negotiated.set_exception(ConsumerError("consumer_closed"))
             if not session.ready.done():
                 session.ready.set_exception(ConsumerError("consumer_closed"))
             # A task canceled before its first instruction cannot run finally.
@@ -359,6 +440,11 @@ class HACameraConsumer:
         except Exception:
             self._fail(session, "negotiation_failed")
         finally:
+            if session.managed_lifetime and not session.release_requested.is_set():
+                # The caller may still own an RTSP publisher. It must reap that
+                # exact reader before permitting peer/public HA callback cleanup.
+                session.phase = "awaiting_release"
+                await asyncio.shield(session.release_requested.wait())
             await self._cleanup(session)
 
     def _signal(self, session: _Session, message: Any) -> None:
@@ -407,7 +493,13 @@ class HACameraConsumer:
                     if answered or not isinstance(text, str) or not text or len(text) > _MAX_SDP:
                         raise ConsumerError("invalid_answer")
                     await session.peer.setRemoteDescription(self._backend.description(text))
+                    if session.closing or session.stopped.is_set():
+                        return
                     answered = True
+                    if not session.negotiated.done():
+                        session.negotiated.set_result(session.info)
+                    if session.frame_received:
+                        self._cancel_startup_timer(session)
                     for candidate in candidates:
                         await session.peer.addIceCandidate(self._backend.candidate(candidate))
                     candidates.clear()
@@ -463,6 +555,8 @@ class HACameraConsumer:
                     session.frame_received = True
                     if not session.ready.done():
                         session.ready.set_result(session.info)
+                    if session.negotiated.done() and session.failure is None:
+                        self._cancel_startup_timer(session)
                 else:
                     await track.recv()  # Drain audio; never send microphone data.
         except asyncio.CancelledError:
@@ -473,6 +567,7 @@ class HACameraConsumer:
             self._fail(session, "media_failed")
 
     async def _cleanup(self, session: _Session) -> None:
+        self._cancel_startup_timer(session)
         session.phase = "cleanup"
         session.closing = True
         session.stopped.set()
@@ -502,10 +597,14 @@ class HACameraConsumer:
                     session.failure = session.failure or "camera_close_failed"
                     session.cleanup_ok = False
         finally:
+            if not session.negotiated.done():
+                session.negotiated.set_exception(ConsumerError(session.failure or "consumer_closed"))
             if not session.ready.done():
                 session.ready.set_exception(ConsumerError(session.failure or "consumer_closed"))
             # Consume exceptions even if opening was canceled before awaiting it.
             if not session.ready.cancelled():
                 session.ready.exception()
+            if not session.negotiated.cancelled():
+                session.negotiated.exception()
             session.closed.set()
             session.phase = "closed"
