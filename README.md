@@ -26,6 +26,20 @@ audio export, microphone/talkback, PTZ, or the recorder's recording policy.
 Existing camera controls remain outside its scope. No camera firmware or
 camera-integration source changes are performed by this integration.
 
+## Compatibility corrections in 0.1.7
+
+PullPoint accepts waits of up to 60 seconds and valid positive `xs:int`
+message limits, while still returning at most 64 queued messages per response.
+A timeout above the supported maximum returns the typed PullMessages fault
+with both supported limits. Capability responses use schema order, accept
+multiple supported categories, and use the standard security attribute names.
+The motion TopicSet uses namespace-qualified roots and unqualified children.
+
+These are protocol corrections, not a change to camera startup, the activation
+window, credentials, peer restrictions, virtual identity or door automations.
+They do not establish that any particular recorder subscribes to motion events;
+that behavior still requires an actual recorder test.
+
 ## Requirements and limits
 
 1. Linux x86_64/amd64 and the target HA camera/WebRTC APIs. ARM, Windows, macOS

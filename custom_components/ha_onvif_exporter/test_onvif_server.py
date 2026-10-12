@@ -288,6 +288,54 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile.get("token"), "standby")
         self.assertEqual(profile.find(m.q(m.SCHEMA, "VideoEncoderConfiguration")).get("token"), "vec")
 
+    async def test_capabilities_multiple_categories_follow_xsd_sequence(self):
+        # ONVIF devicemgmt.wsdl Category is repeatable; onvif.xsd declares
+        # Device, Events and Media in that order, regardless of request order.
+        for version in (m.SOAP11, m.SOAP12):
+            for categories, expected in (((), ["Device", "Events", "Media"]),
+                                         (("All",), ["Device", "Events", "Media"]),
+                                         (("Media", "Events"), ["Events", "Media"]),
+                                         (("Media", "Device", "Events"), ["Device", "Events", "Media"]),
+                                         (("Device",), ["Device"]),
+                                         (("All", "Media"), ["Device", "Events", "Media"])):
+                operation = op(m.DEVICE, "GetCapabilities", [(m.DEVICE, "Category", c) for c in categories])
+                with self.subTest(version=version, categories=categories):
+                    status, root = await self.post(None, raw=soap(operation, version=version),
+                                                  headers={"Content-Type": "text/xml" if version == m.SOAP11 else "application/soap+xml"})
+                    self.assertEqual(status, 200)
+                    caps = root.find(".//" + m.q(m.DEVICE, "Capabilities"))
+                    self.assertEqual([c.tag for c in caps], [m.q(m.SCHEMA, name) for name in expected])
+                    if "Events" in expected:
+                        self.assertEqual(caps.find(m.q(m.SCHEMA, "Events") + "/" + m.q(m.SCHEMA, "WSPullPointSupport")).text, "true")
+        for categories in (("Media", "Media"), ("All", "All"), ("Unknown",), ("Analytics",)):
+            self.assertEqual((await self.post(op(m.DEVICE, "GetCapabilities", [(m.DEVICE, "Category", c) for c in categories])))[0], 400)
+
+    async def test_get_services_nested_capabilities_exact_security_attributes(self):
+        status, root = await self.post(op(m.DEVICE, "GetServices", [(m.DEVICE, "IncludeCapability", "true")]))
+        self.assertEqual(status, 200)
+        services = root.findall(".//" + m.q(m.DEVICE, "Service"))
+        self.assertEqual([s.find(m.q(m.DEVICE, "Namespace")).text for s in services], [m.DEVICE, m.MEDIA, m.EVENTS])
+        for service, namespace in zip(services, (m.DEVICE, m.MEDIA, m.EVENTS)):
+            wrapper = service.find(m.q(m.DEVICE, "Capabilities"))
+            self.assertEqual([e.tag for e in wrapper], [m.q(namespace, "Capabilities")])
+        security = services[0].find(".//" + m.q(m.DEVICE, "Security"))
+        for attribute in ("TLS1.0", "TLS1.1", "TLS1.2", "X.509Token", "HttpDigest"):
+            self.assertEqual(security.get(attribute), "false")
+        self.assertEqual(security.get("UsernameToken"), "true")
+        self.assertFalse(set(security.attrib) & {"TLS1_0", "TLS1_1", "TLS1_2", "X_509Token"})
+
+    async def test_event_properties_topic_descendants_are_ncname_elements(self):
+        status, root = await self.post(op(m.EVENTS, "GetEventProperties"), path="/onvif/events_service")
+        self.assertEqual(status, 200)
+        topics = root.find(".//" + m.q(m.WSTOP, "TopicSet"))
+        self.assertEqual([e.tag for e in topics], [m.q(m.TOPICS, "RuleEngine")])
+        engine = topics[0]
+        self.assertEqual([e.tag for e in engine], ["CellMotionDetector"])
+        self.assertEqual([e.tag for e in engine[0]], ["Motion"])
+        motion = engine[0][0]
+        self.assertEqual(motion.get(m.q(m.WSTOP, "topic")), "true")
+        self.assertEqual(motion.find(m.q(m.SCHEMA, "MessageDescription")).get("IsProperty"), "true")
+
     async def test_stream_uri_pinned_no_arbitrary_url_or_wrong_tokens(self):
         status, root = await self.post(stream_op(), path="/onvif/media_service")
         self.assertEqual(status, 200)
@@ -361,8 +409,88 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for sub in self.server._subscriptions.values():
             self.assertLessEqual(len(sub.queue), m.MAX_MESSAGES)
             self.assertEqual(sub.queue[-1].enabled, self.server._motion)
-        for timeout, limit in (("PT31S", "1"), ("P1D", "1"), ("PT1S", "65"), ("PT1S", "0"), ("PT1S", "NaN")):
+        for timeout, limit in (("P1D", "1"), ("PT1S", "0"), ("PT1S", "NaN"), ("PT0S", "2147483648")):
             self.assertEqual((await self.pull(paths[0], timeout, limit))[0], 400)
+
+    async def test_pull_timeout_above_maximum_has_typed_fault_both_soap_versions(self):
+        path = await self.subscription(lease="PT120S")
+        key = path.rsplit("/", 1)[-1]
+        for version in (m.SOAP11, m.SOAP12):
+            for timeout in ("PT61S", "PT3600S"):
+                operation = op(m.EVENTS, "PullMessages", [(m.EVENTS, "Timeout", timeout), (m.EVENTS, "MessageLimit", "100")])
+                raw_root = ET.fromstring(soap(operation, version=version))
+                header = ET.Element(m.q(version, "Header"))
+                raw_root.insert(0, header)
+                m.add(header, m.WSA, "Action", m.EVENTS + "/PullPointSubscription/PullMessagesRequest")
+                message_id = "urn:uuid:00000000-0000-0000-0000-000000000002"
+                m.add(header, m.WSA, "MessageID", message_id)
+                before = (self.server._subscriptions[key].expires, tuple(self.server._subscriptions[key].queue))
+                with self.subTest(version=version, timeout=timeout):
+                    status, root = await self.post(None, path=path, raw=ET.tostring(raw_root),
+                                                  headers={"Content-Type": "text/xml" if version == m.SOAP11 else "application/soap+xml"})
+                    self.assertEqual(status, 500)
+                    fault = root.find(m.q(version, "Body") + "/" + m.q(version, "Fault"))
+                    self.assertIsNotNone(fault)
+                    detail = fault.find(m.q(version, "Detail") if version == m.SOAP12 else "detail")
+                    typed = detail.find(m.q(m.EVENTS, "PullMessagesFaultResponse"))
+                    self.assertEqual([e.tag for e in typed], [m.q(m.EVENTS, "MaxTimeout"), m.q(m.EVENTS, "MaxMessageLimit")])
+                    self.assertEqual(typed[0].text, "PT60S")
+                    self.assertEqual(typed[1].text, "64")
+                    self.assertEqual(root.find(".//" + m.q(m.WSA, "Action")).text, m.PULL_MESSAGES_FAULT_ACTION)
+                    self.assertEqual(root.find(".//" + m.q(m.WSA, "RelatesTo")).text, message_id)
+                    text = ET.tostring(root).decode()
+                    self.assertNotIn(PASSWORD, text)
+                    self.assertNotIn(timeout, text)
+                    sub = self.server._subscriptions[key]
+                    self.assertEqual((sub.expires, tuple(sub.queue)), before)
+                    self.assertFalse(sub.pulling)
+        self.assertEqual(self.server.diagnostics_snapshot()["operations_successful"]["events_pull_messages"], 0)
+
+    async def test_pull_minute_timeout_is_bounded_and_does_not_renew_lease(self):
+        path = await self.subscription(lease="PT120S")
+        await self.pull(path)
+        key = path.rsplit("/", 1)[-1]
+        sub = self.server._subscriptions[key]
+        expires = sub.expires
+        captured = []
+        async def timeout_now(awaitable, timeout):
+            captured.append(timeout)
+            awaitable.close()
+            raise TimeoutError()
+        operation = op(m.EVENTS, "PullMessages", [(m.EVENTS, "Timeout", "PT60S"), (m.EVENTS, "MessageLimit", "100")])
+        with mock.patch.object(m.asyncio, "wait_for", side_effect=timeout_now):
+            response = await self.server._subscription_dispatch(operation, "127.0.0.1", key)
+        self.assertEqual(captured, [60.0])
+        self.assertEqual(response.tag, m.q(m.EVENTS, "PullMessagesResponse"))
+        self.assertEqual(len(list(response.iter(m.q(m.WSNT, "NotificationMessage")))), 0)
+        self.assertEqual(sub.expires, expires)
+        self.assertFalse(sub.pulling)
+        self.assertEqual((m.MAX_REQUESTS, m.MAX_PULL_POINTS, m.MAX_MESSAGES, m.MAX_PULL_LIMIT), (32, 16, 128, 64))
+
+    async def test_pull_large_positive_xs_int_caps_retrieval_not_queue_or_request(self):
+        path = await self.subscription(lease="PT120S")
+        key = path.rsplit("/", 1)[-1]
+        await self.pull(path)
+        for lexical in ("65", "100", "2147483647", " \t+0000000100\r\n"):
+            sub = self.server._subscriptions[key]
+            sub.queue.clear()
+            for index in range(m.MAX_MESSAGES):
+                self.server._enqueue(sub, m._Notification(index % 2 == 0, m._utc()))
+            expires = sub.expires
+            with self.subTest(lexical=lexical):
+                status, root = await self.pull(path, timeout="PT0S", limit=lexical)
+                self.assertEqual(status, 200)
+                self.assertEqual(len(list(root.iter(m.q(m.WSNT, "NotificationMessage")))), m.MAX_PULL_LIMIT)
+                self.assertEqual(len(sub.queue), m.MAX_MESSAGES - m.MAX_PULL_LIMIT)
+                self.assertEqual(sub.expires, expires)
+                self.assertFalse(sub.pulling)
+                # Remaining messages are retained for the next request.
+                status, root = await self.pull(path, timeout="PT0S", limit="1")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(list(root.iter(m.q(m.WSNT, "NotificationMessage")))), 1)
+                self.assertEqual(len(sub.queue), m.MAX_MESSAGES - m.MAX_PULL_LIMIT - 1)
+        for lexical in ("0", "-1", "-0", "2147483648", "++1", "1.0", "1e2", "\u00a0100", "1 00"):
+            self.assertEqual((await self.pull(path, timeout="PT0S", limit=lexical))[0], 400)
 
     async def test_subscription_peer_binding_expiry_and_concurrent_pull(self):
         path = await self.subscription()

@@ -55,13 +55,14 @@ BASE64_BINARY = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-me
 CONCRETE = "http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete"
 CONCRETE_SET = "http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet"
 MOTION_TOPIC = "tns1:RuleEngine/CellMotionDetector/Motion"
+PULL_MESSAGES_FAULT_ACTION = EVENTS + "/PullPointSubscription/PullMessages/Fault/PullMessagesFaultResponse"
 MAX_BODY = 65536
 MAX_HEADERS = 16384
 MAX_REQUESTS = 32
 MAX_PULL_POINTS = 16
 MAX_MESSAGES = 128
 MAX_PULL_LIMIT = 64
-MAX_PULL_TIMEOUT = 30.0
+MAX_PULL_TIMEOUT = 60.0
 MAX_LEASE = 300.0
 MAX_SNAPSHOT = 2 * 1024 * 1024
 FRESHNESS = 300.0
@@ -121,6 +122,13 @@ class Rejected(Exception):
             raise ValueError("invalid_error_code")
         self.code, self.status = code, status
         super().__init__(code)
+
+
+class _PullMessagesTimeout(Rejected):
+    """Only a syntactically valid pull timeout above the supported maximum."""
+
+    def __init__(self) -> None:
+        super().__init__("InvalidArgVal", 500)
 
 
 def _whitespace(element: ET.Element) -> None:
@@ -545,6 +553,7 @@ class ONVIFServer:
 
     async def _handle(self, request: web.Request) -> web.Response:
         namespace = SOAP12
+        addressing = None
         counted = False
         try:
             peer = self._check_request(request)
@@ -566,6 +575,8 @@ class ONVIFServer:
             response = self._response(namespace, result, addressing=addressing)
             self._record_prepared_response(operation, result)
             return response
+        except _PullMessagesTimeout:
+            return self._pull_messages_fault(namespace, addressing)
         except Rejected as error:
             response = self._fault(namespace, error.code, error.status)
             if error.status == 401:
@@ -610,12 +621,14 @@ class ONVIFServer:
         return value
 
     def _response(self, namespace: str, response: ET.Element, status: int = 200,
-                  addressing: str | None = None) -> web.Response:
+                  addressing: str | None = None, action: str | None = None) -> web.Response:
+        if action is not None and action != PULL_MESSAGES_FAULT_ACTION:
+            raise ValueError("onvif_unknown_response_action")
         envelope = ET.Element(q(namespace, "Envelope"))
         # QName values in text/attributes require explicit declarations.
-        if addressing is not None:
+        if addressing is not None or action is not None:
             header = add(envelope, namespace, "Header")
-            add(header, WSA, "Action", self._action(response, True))
+            add(header, WSA, "Action", action or self._action(response, True))
             if addressing:
                 add(header, WSA, "RelatesTo", addressing)
         body = add(envelope, namespace, "Body")
@@ -645,6 +658,30 @@ class ONVIFServer:
             ET.SubElement(fault, "faultcode").text = "ter:" + code
             ET.SubElement(fault, "faultstring").text = "Request rejected"
         return self._response(namespace, fault, status)
+
+    def _pull_messages_fault(self, namespace: str, addressing: str | None) -> web.Response:
+        """ONVIF PullMessages typed fault; limits are fixed server constants."""
+        fault = ET.Element(q(namespace, "Fault"))
+        if namespace == SOAP12:
+            code = add(fault, namespace, "Code")
+            add(code, namespace, "Value", "s:Sender")
+            add(add(code, namespace, "Subcode"), namespace, "Value", "ter:InvalidArgVal")
+            reason = add(fault, namespace, "Reason")
+            add(reason, namespace, "Text", "Pull timeout exceeds supported maximum",
+                **{q("http://www.w3.org/XML/1998/namespace", "lang"): "en"})
+            detail = add(fault, namespace, "Detail")
+        else:
+            # The SOAP11 envelope is serialized with an automatic prefix;
+            # explicitly bind the prefix used by the faultcode QName value.
+            fault.set("xmlns:s", SOAP11)
+            ET.SubElement(fault, "faultcode").text = "s:Client"
+            ET.SubElement(fault, "faultstring").text = "Pull timeout exceeds supported maximum"
+            detail = ET.SubElement(fault, "detail")
+        limits = add(detail, EVENTS, "PullMessagesFaultResponse")
+        add(limits, EVENTS, "MaxTimeout", "PT60S")
+        add(limits, EVENTS, "MaxMessageLimit", str(MAX_PULL_LIMIT))
+        return self._response(namespace, fault, 500, addressing=addressing,
+                              action=PULL_MESSAGES_FAULT_ACTION)
 
     def _fields(self, operation: ET.Element, allowed: dict[str, tuple[int, int]]) -> dict[str, ET.Element]:
         if operation.attrib:
@@ -691,7 +728,7 @@ class ONVIFServer:
         if name not in permitted:
             raise Rejected("ActionNotSupported", 400)
         allowed = {q(DEVICE, "IncludeCapability"): (0, 1)} if name == "GetServices" else (
-            {q(DEVICE, "Category"): (0, 1)} if name == "GetCapabilities" else {})
+            {q(DEVICE, "Category"): (0, 4)} if name == "GetCapabilities" else {})
         fields = self._fields(operation, allowed)
         response = ET.Element(q(DEVICE, name + "Response"))
         if name == "GetDeviceInformation":
@@ -732,13 +769,16 @@ class ONVIFServer:
                 add(version, SCHEMA, "Major", "2")
                 add(version, SCHEMA, "Minor", "5")
         elif name == "GetCapabilities":
-            category = fields.get(q(DEVICE, "Category"))
-            requested = _leaf(category, 32) if category is not None else "All"
-            if requested not in {"All", "Device", "Media", "Events"}:
+            categories = [_leaf(category, 32) for category in operation]
+            if len(categories) != len(set(categories)):
+                raise Rejected()
+            requested = set(categories or ["All"])
+            if requested - {"All", "Device", "Media", "Events"}:
                 raise Rejected("ActionNotSupported", 400)
             caps = add(response, DEVICE, "Capabilities")
-            for service_name, path in (("Device", "device"), ("Media", "media"), ("Events", "events")):
-                if requested not in {"All", service_name}:
+            # tt:Capabilities uses an XSD sequence: Device, Events, then Media.
+            for service_name, path in (("Device", "device"), ("Events", "events"), ("Media", "media")):
+                if "All" not in requested and service_name not in requested:
                     continue
                 service = add(caps, SCHEMA, service_name)
                 add(service, SCHEMA, "XAddr", self.base_url + f"/onvif/{path}_service")
@@ -787,9 +827,9 @@ class ONVIFServer:
     def _device_capabilities(self) -> ET.Element:
         caps = ET.Element(q(DEVICE, "Capabilities"))
         add(caps, DEVICE, "Network", IPFilter="false", ZeroConfiguration="false", IPVersion6="false", DynDNS="false")
-        add(caps, DEVICE, "Security", TLS1_0="false", TLS1_1="false", TLS1_2="false",
-            X_509Token="false", SAMLToken="false", KerberosToken="false", RELToken="false",
-            UsernameToken="true", HttpDigest="false", RemoteUserHandling="false")
+        add(caps, DEVICE, "Security", **{"TLS1.0": "false", "TLS1.1": "false", "TLS1.2": "false",
+            "X.509Token": "false", "SAMLToken": "false", "KerberosToken": "false", "RELToken": "false",
+            "UsernameToken": "true", "HttpDigest": "false", "RemoteUserHandling": "false"})
         add(caps, DEVICE, "System", DiscoveryResolve="false", DiscoveryBye="false",
             RemoteDiscovery="false", SystemBackup="false", SystemLogging="false", FirmwareUpgrade="false")
         return caps
@@ -917,8 +957,10 @@ class ONVIFServer:
         add(response, WSNT, "FixedTopicSet", "true")
         topics = add(response, WSTOP, "TopicSet")
         engine = add(topics, TOPICS, "RuleEngine")
-        detector = add(engine, TOPICS, "CellMotionDetector")
-        motion = add(detector, TOPICS, "Motion", **{q(WSTOP, "topic"): "true"})
+        # WS-Topics: only the root topic is namespace-qualified; its ordinary
+        # descendants are NCName elements, not additional namespace roots.
+        detector = ET.SubElement(engine, "CellMotionDetector")
+        motion = ET.SubElement(detector, "Motion", {q(WSTOP, "topic"): "true"})
         description = add(motion, SCHEMA, "MessageDescription", IsProperty="true")
         source = add(description, SCHEMA, "Source")
         add(source, SCHEMA, "SimpleItemDescription", Name="VideoSourceConfigurationToken", Type="tt:ReferenceToken")
@@ -972,10 +1014,17 @@ class ONVIFServer:
             raise Rejected("ResourceUnknown", 400)
         if operation.tag == q(EVENTS, "PullMessages"):
             fields = self._fields(operation, {q(EVENTS, "Timeout"): (1, 1), q(EVENTS, "MessageLimit"): (1, 1)})
-            timeout = _duration(_leaf(fields[q(EVENTS, "Timeout")], 64), MAX_PULL_TIMEOUT)
-            limit_text = _leaf(fields[q(EVENTS, "MessageLimit")], 3)
-            if not re.fullmatch(r"[0-9]{1,3}", limit_text) or not 1 <= int(limit_text) <= MAX_PULL_LIMIT:
+            # Parse bounded duration syntax first, so a valid unsupported
+            # timeout gets its typed fault instead of an InvalidArgVal reply.
+            timeout = _duration(_leaf(fields[q(EVENTS, "Timeout")], 64), float("inf"))
+            if timeout > MAX_PULL_TIMEOUT:
+                raise _PullMessagesTimeout()
+            limit_text = _leaf(fields[q(EVENTS, "MessageLimit")], 64).strip(" \t\r\n")
+            if not re.fullmatch(r"\+?[0-9]{1,10}", limit_text) or not 1 <= int(limit_text) <= 2147483647:
                 raise Rejected()
+            # xs:int requests may exceed our retrieval capacity. ONVIF requires
+            # returning fewer messages rather than faulting in that case.
+            message_limit = min(int(limit_text), MAX_PULL_LIMIT)
             if sub.pulling:
                 raise Rejected("MaxConcurrentPullRequests", 400)
             sub.pulling = True
@@ -991,7 +1040,7 @@ class ONVIFServer:
                 response = ET.Element(q(EVENTS, "PullMessagesResponse"))
                 add(response, EVENTS, "CurrentTime", _utc(self._clock()))
                 add(response, EVENTS, "TerminationTime", _utc(self._clock() + max(0.0, sub.expires - self._monotonic())))
-                for _ in range(min(int(limit_text), len(sub.queue))):
+                for _ in range(min(message_limit, len(sub.queue))):
                     self._notification_xml(response, sub.queue.popleft())
                 return response
             finally:

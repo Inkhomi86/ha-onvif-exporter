@@ -53,6 +53,15 @@ It is a video-ready recording hint, not pixel motion detection or recognition.
 The manager must validate actual Protect interpretation before claiming recording
 behavior; PullPoint unit tests are not a Protect/AI hardware acceptance test.
 
+TopicSet uses a namespace-qualified root and unqualified descendant topic names.
+Topic-expression filtering remains a limited implementation: it compares the
+supported literal expressions rather than resolving root prefixes against their
+in-scope namespace bindings. An equivalent expression with a different prefix
+can therefore be rejected, and the supported literal prefix does not validate
+its namespace binding. General QName filter interoperability is not claimed.
+These verified protocol limitations do not establish the cause of any Protect
+recording or subscription behavior.
+
 ## Security and bounds
 
 Exact peer ACL uses the TCP peer, never forwarding headers. WS UsernameToken
@@ -60,6 +69,8 @@ PasswordDigest and canonical HTTP Basic are supported; HTTP Digest is not
 advertised or implemented. Only the UTC GetSystemDateAndTime query is public,
 and only to allowed peers; malformed supplied authentication still fails.
 Protect's observed SOAP12 unqualified `mustUnderstand="1"` is accepted exactly.
+Device-service security capabilities use the schema's exact attribute names
+`TLS1.0`, `TLS1.1`, `TLS1.2` and `X.509Token`, not underscore aliases.
 
 WS freshness is 300 seconds, future skew 30, replay retention 331, cache capacity
 4096; valid credentials are compared in constant time. Cache is event-loop
@@ -74,11 +85,26 @@ unapproved operations/fields are rejected. No request bodies/credentials or raw
 exceptions are logged. Access logging is disabled.
 
 There are at most 32 active requests, 16 PullPoints, 128 queued notifications per
-PullPoint, 64 messages per response, 30 seconds per pull, 300 seconds per lease,
+PullPoint, 64 messages per response, 60 seconds per pull, 300 seconds per lease,
 3 seconds per request-body read, 2 seconds/2 MiB per snapshot. Queue overflow
 coalesces to Initialized current state instead of retaining a stale motion flag.
 Expired/unsubscribed/stopped subscriptions wake waiters. Pending cancellation
 releases the per-subscription pull guard. No push URL is ever followed.
+
+PullMessages accepts positive `xs:int` MessageLimit values through 2147483647,
+including an optional plus sign and surrounding XML whitespace, but retrieves
+at most 64 queued notifications per response. A supported timeout above 60 s
+returns a typed PullMessages fault with MaxTimeout/MaxMessageLimit and its
+WS-Addressing fault action, without waiting for that duration. The 60 s pull
+bound does not change the manager's rolling 30 s live-video window, its triggers,
+standby fallback or the existing subscription-lease behavior.
+
+Subscription leases still expire at their existing termination time unless an
+explicit Renew extends them; PullMessages does not automatically extend a lease.
+ONVIF Core section 9.1.1 recommends keeping a subscription active for at least
+the requested Timeout after the response. That keepalive recommendation is not
+implemented here, and this compatibility limitation has not been established
+as the cause of any particular client behavior.
 
 ## Local tests and sources
 
@@ -93,6 +119,8 @@ Primary API references consulted (no third-party implementation source copied):
 - [ONVIF Device WSDL](https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl)
 - [ONVIF Media WSDL](https://www.onvif.org/ver10/media/wsdl/media.wsdl)
 - [ONVIF Events WSDL](https://www.onvif.org/ver10/events/wsdl/event.wsdl)
+- [ONVIF Core Specification](https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf)
+- [OASIS WS-Topics 1.3](https://docs.oasis-open.org/wsn/wsn-ws_topics-1.3-spec-os.htm)
 - [OASIS UsernameToken Profile 1.1.1](https://docs.oasis-open.org/wss-m/wss/v1.1.1/os/wss-UsernameTokenProfile-v1.1.1-os.html)
 - [defusedxml documentation](https://pypi.org/project/defusedxml/)
 - [HA 2026.8.1 core requirements](https://github.com/home-assistant/core/blob/2026.8.1/requirements.txt)
